@@ -1,0 +1,45 @@
+{
+  "name": "sns-trend-lab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sns": "node src/cli.js",
+    "web:dev": "concurrently -k \"uv run uvicorn web_api.main:app --host 127.0.0.1 --port 8787 --reload\" \"vite --config web/vite.config.ts\"",
+    "web:build": "vite build --config web/vite.config.ts",
+    "web:start": "uv run uvicorn web_api.main:app --host 127.0.0.1 --port 8787",
+    "web": "npm run web:build && npm run web:start",
+    "test": "node --test test/analyzer.test.js test/scheduler.test.js test/utils.test.js test/youtube.test.js",
+    "test:web": "vitest run --config web/vite.config.ts",
+    "test:db": "node --test test/db-collector.integration.test.js",
+    "test:all": "npm test && npm run test:web && uv run pytest && npm run test:db"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@tanstack/react-table": "^8.21.3",
+    "dotenv": "^17.4.2",
+    "echarts": "^6.1.0",
+    "i18next": "^26.3.0",
+    "lucide-react": "^1.17.0",
+    "mysql2": "^3.22.4",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-i18next": "^17.0.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.2.16",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "concurrently": "^10.0.3",
+    "jsdom": "^29.1.1",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-api",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "uvicorn",
+        "web_api.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8787",
+        "--reload"
+      ],
+      "port": 8787
+    },
+    {
+      "name": "web-frontend",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "vite",
+        "--config",
+        "web/vite.config.ts"
+      ],
+      "port": 5173
+    }
+  ]
+}

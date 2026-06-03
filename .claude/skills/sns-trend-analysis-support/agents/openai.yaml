@@ -1,0 +1,4 @@
+interface:
+  display_name: "SNS Trend Analysis Support"
+  short_description: "Analyze real YouTube trends from local MySQL"
+  default_prompt: "Use $sns-trend-analysis-support to collect or analyze Japanese YouTube trend data in sns_trend_lab and recommend evidence-based improvements."
