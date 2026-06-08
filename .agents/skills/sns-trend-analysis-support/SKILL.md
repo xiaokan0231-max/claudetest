@@ -22,6 +22,8 @@ Read [references/mysql-data-model.md](references/mysql-data-model.md) before wri
 
 - `analysis_runs` — run window, status, `report_markdown` (zh-CN), `report_markdown_ja` (ja-JP), and `summary_json` (bilingual facts / hypotheses / validation needs / recommendations / limitations).
 - `analysis_post_metrics`, `analysis_topic_metrics`, `analysis_query_metrics`, `analysis_popular_metrics` — per-video, per-topic, per-keyword, and per-chart metrics.
+- `analysis_comment_metrics`, `analysis_comment_daily_metrics`, `analysis_comment_terms` — materialized comment sentiment, daily volume, hot words, phrases, emoji, hashtags, and topic lift.
+- `skill_analysis_runs` — saved ad-hoc Skill analyses shown on the web app's Skill Analysis page.
 - Views `v_latest_post_metrics`, `v_post_growth_metrics`, `v_latest_query_metrics`, `v_latest_popular_videos` for quick latest-state lookups.
 
 Read [references/metrics-and-analysis.md](references/metrics-and-analysis.md) before interpreting results, and [references/report-template.md](references/report-template.md) when drafting business-facing analysis.
@@ -35,6 +37,7 @@ npm run sns -- collect:estimate                       # check quota cost before 
 npm run sns -- collect                                # gather a new snapshot
 npm run sns -- analyze --days 30                      # rebuild materialized metrics + bilingual report
 npm run sns -- report:show --run-id latest --lang ja  # show a stored report (zh | ja)
+npm run sns -- skill-analysis:list --json             # inspect saved Skill analyses
 ```
 
 Query and schedule management:
@@ -58,6 +61,19 @@ Run `schedule:install` only after confirming a valid YouTube Data API v3 key in 
 - Frame recommendations as: Action → Evidence → Expected signal → Validation method.
 - Disclose the YouTube Shorts `viewCount` definition change effective 2025-03-31.
 - Comments: store public comment text only as pseudonymized opinion data — the HMAC-hashed `author_key` (never the raw channel ID, display name, or avatar) and PII-scrubbed `text_content`. Treat comments as a self-selected, biased sample (commenters, not all viewers, and only within the videos your keywords surface); sentiment is interpretation, not ground truth. Honor deletions and a retention window; do not store unnecessary personal information.
+- Prefer materialized comment insight tables over reading raw comment text. Use raw text only when the requested analysis cannot be answered from aggregates, and never quote or expose individual comments in saved results.
+
+## Saving a Skill analysis
+
+After completing a useful open-ended analysis, save it by default unless the user explicitly says not to save it. Pipe one JSON object to the CLI; do not create a JSON data file:
+
+```bash
+printf '%s' "$SKILL_ANALYSIS_JSON" | npm run sns -- skill-analysis:save --json
+```
+
+The object must include `question`, `title`, `locale`, `reportMarkdown`, `sections`, and `charts`. Include `sourceBatchId`, `sourceAnalysisRunId`, `windowStart`, and `windowEnd` when available. `sections` has `facts`, `hypotheses`, `validationNeeds`, `recommendations`, and `limitations` arrays. Charts are optional and limited to `bar`, `stackedBar`, `line`, `scatter`, or `table`, with `title`, optional `subtitle`, `fields`, and bounded `rows`.
+
+Use charts only when they make a comparison clearer. Prefer horizontal bars for ranked hot words and phrases, 100% stacked bars for sentiment composition, lines only when at least 8 time points exist, and tables for sparse exact lookup. Never save HTML, executable code, arbitrary ECharts options, secrets, raw comments, or personal identifiers.
 
 ## Example tasks this skill is for
 
@@ -77,3 +93,4 @@ When responding in chat, state:
 - Which statements are facts, which are hypotheses, and what still needs validation.
 
 Reports are stored in `analysis_runs.report_markdown` and `analysis_runs.report_markdown_ja`; do not write report files.
+Ad-hoc Skill analyses are stored in `skill_analysis_runs`; the web app only displays them and never invokes Codex.

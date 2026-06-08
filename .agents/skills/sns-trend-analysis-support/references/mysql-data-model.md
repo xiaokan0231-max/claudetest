@@ -30,6 +30,10 @@ All business timestamps are stored as UTC `DATETIME(6)` and should be presented 
 | Table | Purpose |
 | --- | --- |
 | `analysis_runs` | Analysis window, status, parameters, and Markdown report body |
+| `analysis_comment_metrics` | Comment sentiment and author counts by overall, query topic, and video |
+| `analysis_comment_daily_metrics` | Daily comment volume and sentiment aggregates |
+| `analysis_comment_terms` | Hot words, phrases, emoji, hashtags, sentiment-specific terms, and topic lift |
+| `skill_analysis_runs` | Persisted ad-hoc Codex Skill analysis, sections, and validated chart data |
 | `analysis_post_metrics` | Latest video metrics and growth calculations |
 | `analysis_topic_metrics` | Query topic, category, and tag aggregations |
 | `analysis_query_metrics` | Approximate result-count movement and sample performance |

@@ -15,7 +15,7 @@ const STOPWORDS = new Set([
   "他们", "视频", "评论", "已经", "还是", "这样", "那样", "真的",
   // English common
   "the", "and", "for", "you", "this", "that", "are", "was", "with", "have", "but",
-  "not", "can", "all", "your", "from", "they", "video", "just", "really",
+  "not", "can", "all", "your", "from", "they", "video", "just", "really", "no",
 ]);
 
 let segmenter;
@@ -65,6 +65,14 @@ export function extractHashtags(text) {
   );
 }
 
+export function buildBigrams(tokens) {
+  const output = [];
+  for (let index = 0; index < tokens.length - 1; index += 1) {
+    output.push(`${tokens[index]} ${tokens[index + 1]}`);
+  }
+  return output;
+}
+
 function topCounts(map, limit) {
   return [...map.entries()]
     .map(([term, count]) => ({ term, count }))
@@ -75,16 +83,21 @@ function topCounts(map, limit) {
 // Build word / emoji / hashtag frequency tables from comment rows ({ text_content }).
 export function buildCommentTerms(
   commentRows,
-  { wordLimit = 40, emojiLimit = 15, hashtagLimit = 15 } = {},
+  { wordLimit = 40, phraseLimit = 30, emojiLimit = 15, hashtagLimit = 15 } = {},
 ) {
   const words = new Map();
+  const phrases = new Map();
   const emojis = new Map();
   const hashtags = new Map();
   const bump = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
   for (const row of commentRows ?? []) {
     const text = row.text_content;
-    for (const word of tokenize(text)) {
+    const tokens = tokenize(text);
+    for (const word of tokens) {
       bump(words, word);
+    }
+    for (const phrase of buildBigrams(tokens)) {
+      bump(phrases, phrase);
     }
     for (const emoji of extractEmojis(text)) {
       bump(emojis, emoji);
@@ -95,6 +108,7 @@ export function buildCommentTerms(
   }
   return {
     words: topCounts(words, wordLimit),
+    phrases: topCounts(phrases, phraseLimit),
     emojis: topCounts(emojis, emojiLimit),
     hashtags: topCounts(hashtags, hashtagLimit),
   };

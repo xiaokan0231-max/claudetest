@@ -3,11 +3,16 @@ import { chunk, sleep } from "./utils.js";
 const API_BASE = "https://www.googleapis.com/youtube/v3";
 
 export const QUOTA_COSTS = {
-  searchList: 100,
+  searchList: 1,
   videosList: 1,
   channelsList: 1,
   categoriesList: 1,
   commentThreadsList: 1,
+};
+
+export const QUOTA_BUCKETS = {
+  search: "search_requests_per_day",
+  standard: "standard_units_per_day",
 };
 
 export function buildYouTubeApiUrl(resource, params) {
@@ -20,20 +25,31 @@ export function buildYouTubeApiUrl(resource, params) {
   return url;
 }
 
-export function estimateCollectionQuota(queries, activePostCount, commentRequests = 0) {
+export function estimateCollectionQuotaBuckets(
+  queries,
+  activePostCount,
+  commentRequests = 0,
+) {
   const maximumDiscoveredPosts =
     queries.reduce((sum, query) => sum + Number(query.max_results), 0) + 50;
   const maximumRequestedPosts = maximumDiscoveredPosts + Number(activePostCount);
   const detailRequests = Math.ceil(maximumRequestedPosts / 50);
   const channelRequests = Math.ceil(maximumRequestedPosts / 50);
-  return (
-    queries.length * QUOTA_COSTS.searchList +
+  return {
+    [QUOTA_BUCKETS.search]: queries.length * QUOTA_COSTS.searchList,
+    [QUOTA_BUCKETS.standard]:
     QUOTA_COSTS.videosList +
     QUOTA_COSTS.categoriesList +
     detailRequests * QUOTA_COSTS.videosList +
     channelRequests * QUOTA_COSTS.channelsList +
-    Number(commentRequests) * QUOTA_COSTS.commentThreadsList
-  );
+    Number(commentRequests) * QUOTA_COSTS.commentThreadsList,
+  };
+}
+
+export function estimateCollectionQuota(queries, activePostCount, commentRequests = 0) {
+  return estimateCollectionQuotaBuckets(queries, activePostCount, commentRequests)[
+    QUOTA_BUCKETS.standard
+  ];
 }
 
 function sanitizeApiError(payload, status) {
@@ -47,31 +63,51 @@ function sanitizeApiError(payload, status) {
 }
 
 export class YouTubeClient {
-  constructor({ apiKey, quotaBudget, fetchImpl = globalThis.fetch }) {
+  constructor({
+    apiKey,
+    quotaBudget,
+    searchQuotaBudget = 100,
+    fetchImpl = globalThis.fetch,
+  }) {
     this.apiKey = apiKey;
-    this.quotaBudget = quotaBudget;
+    this.quotaBudgets = {
+      [QUOTA_BUCKETS.standard]: quotaBudget,
+      [QUOTA_BUCKETS.search]: searchQuotaBudget,
+    };
     this.fetchImpl = fetchImpl;
     this.quotaUsed = 0;
+    this.quotaUsedByBucket = {
+      [QUOTA_BUCKETS.standard]: 0,
+      [QUOTA_BUCKETS.search]: 0,
+    };
     this.requestCount = 0;
   }
 
-  ensureBudget(cost) {
-    if (this.quotaUsed + cost > this.quotaBudget) {
+  ensureBudget(cost, bucket) {
+    const used = this.quotaUsedByBucket[bucket] ?? 0;
+    const budget = this.quotaBudgets[bucket];
+    if (budget !== undefined && used + cost > budget) {
+      const label =
+        bucket === QUOTA_BUCKETS.search
+          ? "SNS_SEARCH_QUOTA_BUDGET"
+          : "SNS_QUOTA_BUDGET";
       throw new Error(
-        `Collection would exceed SNS_QUOTA_BUDGET=${this.quotaBudget} units`,
+        `Collection would exceed ${label}=${budget} for ${bucket}`,
       );
     }
   }
 
-  async request(resource, params, cost) {
+  async request(resource, params, cost, bucket = QUOTA_BUCKETS.standard) {
     let lastError;
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      this.ensureBudget(cost);
+      this.ensureBudget(cost, bucket);
       const url = buildYouTubeApiUrl(resource, {
         ...params,
         key: this.apiKey,
       });
-      this.quotaUsed += cost;
+      this.quotaUsedByBucket[bucket] =
+        (this.quotaUsedByBucket[bucket] ?? 0) + cost;
+      this.quotaUsed = this.quotaUsedByBucket[QUOTA_BUCKETS.standard];
       this.requestCount += 1;
 
       try {
@@ -120,6 +156,7 @@ export class YouTubeClient {
         maxResults: query.max_results,
       },
       QUOTA_COSTS.searchList,
+      QUOTA_BUCKETS.search,
     );
   }
 

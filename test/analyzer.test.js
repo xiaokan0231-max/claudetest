@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildReportModel,
+  buildCommentInsights,
   buildCommentMetrics,
   buildPostMetrics,
   buildQueryMetrics,
@@ -159,6 +160,37 @@ test("buildCommentMetrics aggregates overall and per-topic sentiment", () => {
   const seisei = summary.byTopic.find((topic) => topic.topic === "生成AI");
   assert.equal(seisei.commentCount, 3);
   assert.equal(seisei.distinctAuthors, 2);
+});
+
+test("buildCommentInsights materializes video, daily, phrase, and sentiment terms", () => {
+  const insight = buildCommentInsights([
+    {
+      comment_id: "1",
+      post_id: "video-1",
+      post_title: "AI video",
+      author_key: "a",
+      text_content: "最高 生成 AI 🔥 #生成AI",
+      published_at: "2026-06-01 10:00:00.000000",
+      topics: "生成AI",
+    },
+    {
+      comment_id: "2",
+      post_id: "video-1",
+      post_title: "AI video",
+      author_key: "b",
+      text_content: "最悪 生成 AI",
+      published_at: "2026-06-02 10:00:00.000000",
+      topics: "生成AI",
+    },
+  ]);
+  assert.ok(insight.metrics.some((item) => item.dimensionType === "post"));
+  assert.equal(insight.dailyMetrics.length, 6);
+  assert.ok(insight.terms.some((item) => item.termType === "phrase"));
+  assert.ok(
+    insight.terms.some(
+      (item) => item.sentimentLabel === "positive" && item.termType === "word",
+    ),
+  );
 });
 
 test("tokenize drops stopwords, single chars, and numbers", () => {

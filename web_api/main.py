@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import settings
 from .db import engine, fetch_all, fetch_one, serialize_row
+from .quota import fetch_google_quota
 from .security import ACTION_TOKEN, require_write_request
 from .tasks import launch_operation, run_node_cli
 
@@ -108,6 +110,8 @@ def system_status() -> dict[str, Any]:
         "source": "YouTube Data API v3",
         "timezone": settings.timezone,
         "quotaBudget": settings.quota_budget,
+        "searchQuotaBudget": settings.search_quota_budget,
+        "googleCloudProjectConfigured": bool(settings.google_cloud_project),
         "youtubeApiConfigured": settings.youtube_api_configured,
         "latestBatch": latest_batch,
         "latestAnalysis": latest_analysis,
@@ -115,9 +119,134 @@ def system_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/system/quota")
+async def system_quota() -> dict[str, Any]:
+    local_usage = fetch_all(
+        """
+        SELECT CAST(q.batch_id AS CHAR) AS batch_id, b.observed_at,
+               q.quota_bucket, q.estimated_units, q.actual_units
+        FROM collection_quota_usage q
+        JOIN collection_batches b ON b.id = q.batch_id
+        ORDER BY b.observed_at DESC, q.quota_bucket
+        LIMIT 100
+        """
+    )
+    try:
+        result = await asyncio.to_thread(
+            fetch_google_quota,
+            settings.google_cloud_project,
+        )
+    except Exception as exc:
+        result = {
+            "status": "unavailable",
+            "errorCode": "GOOGLE_QUOTA_UNAVAILABLE",
+            "message": str(exc)[:500],
+            "buckets": [],
+        }
+    result["localUsage"] = local_usage
+    result["localBudgets"] = {
+        "standard_units_per_day": settings.quota_budget,
+        "search_requests_per_day": settings.search_quota_budget,
+    }
+    return result
+
+
+def _quota_bucket(quota: dict[str, Any], metric: str) -> dict[str, Any] | None:
+    for bucket in quota.get("buckets") or []:
+        if (
+            bucket.get("quotaMetric") == metric
+            and bucket.get("period") == "day"
+            and bucket.get("scope") == "project"
+        ):
+            return bucket
+    return None
+
+
+def _enrich_quota_plan_with_google(
+    plan: dict[str, Any],
+    quota: dict[str, Any],
+) -> dict[str, Any]:
+    search_bucket = _quota_bucket(quota, "youtube.googleapis.com/search_list")
+    standard_bucket = _quota_bucket(quota, "youtube.googleapis.com/default")
+    if not search_bucket and not standard_bucket:
+        return {**plan, "googleQuota": quota}
+
+    updated = json.loads(json.dumps(plan))
+    if search_bucket:
+        limit = float(search_bucket.get("limit") or 0)
+        used = float(search_bucket.get("used") or 0)
+        target = int(limit * updated.get("targetSearchUsageRatio", 0.75))
+        updated["search"].update(
+            {
+                "limit": limit,
+                "used": used,
+                "target": target,
+                "safeAvailable": max(0, target - used),
+            }
+        )
+    if standard_bucket:
+        limit = float(standard_bucket.get("limit") or 0)
+        used = float(standard_bucket.get("used") or 0)
+        target = int(limit * updated.get("targetStandardUsageRatio", 0.7))
+        updated["standard"].update(
+            {
+                "limit": limit,
+                "used": used,
+                "target": target,
+                "safeAvailable": max(0, target - used),
+            }
+        )
+
+    enabled_queries = int(updated["collection"].get("enabledQueryCount") or 0)
+    suggested = int(updated["candidates"].get("suggestedCount") or 0)
+    estimated_search = float(updated["collection"].get("estimatedSearchRequests") or 0)
+    estimated_standard = float(updated["collection"].get("estimatedStandardUnits") or 0)
+    safe_search = float(updated["search"].get("safeAvailable") or 0)
+    safe_standard = float(updated["standard"].get("safeAvailable") or 0)
+    safe_approval_slots = max(0, int(safe_search - enabled_queries))
+    updated["candidates"]["safeApprovalSlots"] = safe_approval_slots
+    updated["candidates"]["recommendedApprovalCount"] = min(suggested, safe_approval_slots)
+    updated["collection"]["shouldCollect"] = (
+        enabled_queries > 0
+        and estimated_search <= safe_search
+        and estimated_standard <= safe_standard
+    )
+    updated["quotaStatus"] = quota.get("status", updated.get("quotaStatus"))
+    updated["source"] = "google_cloud_monitoring"
+    updated["googleQuota"] = quota
+    return updated
+
+
+@app.get("/api/quota/plan")
+async def quota_plan() -> dict[str, Any]:
+    payload = await asyncio.to_thread(run_node_cli, ["quota:plan"])
+    if not payload.get("ok"):
+        error = payload.get("error") or {}
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": error.get("code", "QUOTA_PLAN_FAILED"),
+                "message": error.get("message", "Unable to build quota plan"),
+            },
+        )
+    try:
+        google_quota = await asyncio.to_thread(
+            fetch_google_quota,
+            settings.google_cloud_project,
+        )
+    except Exception as exc:
+        google_quota = {
+            "status": "unavailable",
+            "errorCode": "GOOGLE_QUOTA_UNAVAILABLE",
+            "message": str(exc)[:500],
+            "buckets": [],
+        }
+    return _enrich_quota_plan_with_google(payload["result"], google_quota)
+
+
 @app.get("/api/actions/collect-estimate")
-async def collect_estimate() -> dict[str, Any]:
-    payload = await asyncio.to_thread(run_node_cli, ["collect:estimate"])
+async def collect_estimate(mode: Literal["standard", "balanced"] = "balanced") -> dict[str, Any]:
+    payload = await asyncio.to_thread(run_node_cli, ["collect:estimate", "--mode", mode])
     if not payload.get("ok"):
         error = payload.get("error") or {}
         raise HTTPException(
@@ -134,18 +263,31 @@ class AnalyzeBody(BaseModel):
     days: Literal[7, 30, 90] = 30
 
 
+class CollectBody(BaseModel):
+    mode: Literal["standard", "balanced"] = "balanced"
+
+
+class ScheduleInstallBody(BaseModel):
+    hour: int = Field(default=7, ge=0, le=23)
+    minute: int = Field(default=0, ge=0, le=59)
+    frequency: Literal["once", "every_2h", "every_4h", "every_6h", "every_12h"] = "once"
+    mode: Literal["standard", "balanced"] = "balanced"
+    runAnalyze: bool = True
+    analyzeDays: int = Field(default=30, ge=1, le=365)
+
+
 class EmptyBody(BaseModel):
     pass
 
 
 @app.post("/api/actions/collect", dependencies=[Depends(require_write_request)])
-async def collect_action(_: EmptyBody) -> dict[str, str]:
+async def collect_action(body: CollectBody) -> dict[str, str]:
     if not settings.youtube_api_configured:
         raise HTTPException(
             status_code=400,
             detail={"code": "MISSING_API_KEY", "message": "YouTube API key is not configured"},
         )
-    return {"requestId": launch_operation("collect", {})}
+    return {"requestId": launch_operation("collect", {"mode": body.mode})}
 
 
 @app.post("/api/actions/analyze", dependencies=[Depends(require_write_request)])
@@ -380,6 +522,49 @@ VIDEO_SORTS = {
 }
 
 
+def _number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _peer_rank(rows: list[dict[str, Any]], post_id: str, field: str) -> dict[str, Any]:
+    comparable = [row for row in rows if _number(row.get(field)) is not None]
+    selected = next((row for row in comparable if row.get("post_id") == post_id), None)
+    selected_value = _number(selected.get(field)) if selected else None
+    if selected_value is None:
+        return {"value": None, "rank": None, "total": len(comparable), "percentile": None}
+    rank = 1 + sum(1 for row in comparable if (_number(row.get(field)) or 0) > selected_value)
+    total = len(comparable)
+    percentile = round((total - rank + 1) / total * 100, 2) if total else None
+    return {
+        "value": str(selected.get(field)),
+        "rank": rank,
+        "total": total,
+        "percentile": percentile,
+    }
+
+
+def _extract_title_terms(title: str) -> list[str]:
+    cleaned = re.sub(r"https?://\S+", " ", title or "")
+    parts = re.split(r"[\s,，。・/／|｜【】\[\]()（）「」『』:：#]+", cleaned)
+    terms: list[str] = []
+    for part in parts:
+        token = part.strip()
+        if len(token) < 2 or token.isdigit():
+            continue
+        if token.lower() in {"shorts", "live", "official", "full"}:
+            continue
+        if token not in terms:
+            terms.append(token)
+        if len(terms) >= 12:
+            break
+    return terms
+
+
 @app.get("/api/videos")
 def videos(
     page: int = Query(1, ge=1),
@@ -540,7 +725,7 @@ def video_detail(post_id: str, analysis_run_id: str | None = None) -> dict[str, 
     )
     item["queries"] = fetch_all(
         """
-        SELECT CAST(q.id AS CHAR) AS id, q.name, q.topic, m.latest_rank
+        SELECT CAST(q.id AS CHAR) AS id, q.name, q.query_text, q.topic, m.latest_rank
         FROM post_query_matches m
         JOIN tracked_queries q ON q.id = m.query_id
         WHERE m.post_id = :post_id
@@ -548,6 +733,64 @@ def video_detail(post_id: str, analysis_run_id: str | None = None) -> dict[str, 
         """,
         {"post_id": post_id},
     )
+    item["popularHistory"] = fetch_all(
+        """
+        SELECT CAST(batch_id AS CHAR) AS batch_id, observed_at, region_code,
+               rank_position
+        FROM popular_video_observations
+        WHERE post_id = :post_id
+        ORDER BY observed_at DESC, rank_position
+        LIMIT 30
+        """,
+        {"post_id": post_id},
+    )
+    item["popularSummary"] = fetch_one(
+        """
+        SELECT appearance_count, best_rank, latest_rank, first_observed_at,
+               latest_observed_at
+        FROM analysis_popular_metrics
+        WHERE analysis_run_id = :run_id AND post_id = :post_id
+        """,
+        {"post_id": post_id, "run_id": run_id},
+    )
+    peer_rows = fetch_all(
+        """
+        SELECT DISTINCT m.post_id,
+               CAST(m.latest_views AS CHAR) AS latest_views,
+               CAST(m.reaction_rate_pct AS CHAR) AS reaction_rate_pct,
+               CAST(m.views_growth_per_day AS CHAR) AS views_growth_per_day
+        FROM analysis_post_metrics m
+        JOIN post_query_matches pm ON pm.post_id = m.post_id
+        JOIN tracked_queries q ON q.id = pm.query_id
+        WHERE m.analysis_run_id = :run_id
+          AND q.topic IN (
+            SELECT DISTINCT q2.topic
+            FROM post_query_matches pm2
+            JOIN tracked_queries q2 ON q2.id = pm2.query_id
+            WHERE pm2.post_id = :post_id
+          )
+        """,
+        {"post_id": post_id, "run_id": run_id},
+    )
+    item["peerComparison"] = {
+        "peerCount": len(peer_rows),
+        "views": _peer_rank(peer_rows, post_id, "latest_views"),
+        "reactionRate": _peer_rank(peer_rows, post_id, "reaction_rate_pct"),
+        "growthPerDay": _peer_rank(peer_rows, post_id, "views_growth_per_day"),
+    }
+    query_texts = [str(query.get("query_text") or "") for query in item["queries"]]
+    item["contentSignals"] = {
+        "titleTerms": _extract_title_terms(item.get("title") or ""),
+        "matchedQueries": [
+            query for query in query_texts
+            if query and query.lower() in str(item.get("title") or "").lower()
+        ],
+        "tagCount": len(item["tags"]),
+        "discoverySources": {
+            "keywordSample": len(item["queries"]) > 0,
+            "popularChart": len(item["popularHistory"]) > 0,
+        },
+    }
     item["snapshots"] = fetch_all(
         """
         SELECT observed_at, CAST(views AS CHAR) AS views,
@@ -585,6 +828,173 @@ def popular() -> dict[str, Any]:
         """
     )
     return {"items": items}
+
+
+@app.get("/api/comment-insights")
+def comment_insights(
+    analysis_run_id: str | None = None,
+    topic: str | None = None,
+    post_id: str | None = None,
+    sentiment: Literal["all", "positive", "neutral", "negative"] = "all",
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    run_id = analysis_run_id or latest_analysis_id()
+    if not run_id:
+        return {
+            "analysisRunId": None,
+            "metrics": [],
+            "daily": [],
+            "terms": [],
+            "sentimentTerms": [],
+            "topicFeatures": [],
+            "filters": {"runs": [], "topics": [], "videos": []},
+        }
+    dimension_type = "overall"
+    dimension_value = "ALL"
+    if post_id:
+        dimension_type, dimension_value = "post", post_id
+    elif topic:
+        dimension_type, dimension_value = "query_topic", topic
+    params: dict[str, Any] = {
+        "run_id": run_id,
+        "dimension_type": dimension_type,
+        "dimension_value": dimension_value,
+        "sentiment": sentiment,
+    }
+    daily_where = [
+        "analysis_run_id = :run_id",
+        "dimension_type = :dimension_type",
+        "dimension_value = :dimension_value",
+    ]
+    if date_from:
+        daily_where.append("comment_date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        daily_where.append("comment_date <= :date_to")
+        params["date_to"] = date_to
+    metrics = fetch_all(
+        """
+        SELECT dimension_type, dimension_value, comment_count, distinct_authors,
+               positive_count, neutral_count, negative_count,
+               CAST(net_sentiment_pct AS CHAR) AS net_sentiment_pct
+        FROM analysis_comment_metrics
+        WHERE analysis_run_id = :run_id
+        ORDER BY (dimension_type = 'overall') DESC, comment_count DESC
+        """,
+        params,
+    )
+    terms = fetch_all(
+        """
+        SELECT dimension_type, dimension_value, sentiment_label, term_type, term,
+               count, CAST(share_pct AS CHAR) AS share_pct,
+               CAST(lift_score AS CHAR) AS lift_score
+        FROM analysis_comment_terms
+        WHERE analysis_run_id = :run_id
+          AND dimension_type = :dimension_type
+          AND dimension_value = :dimension_value
+          AND sentiment_label = :sentiment
+        ORDER BY term_type, count DESC, term
+        """,
+        params,
+    )
+    sentiment_terms = fetch_all(
+        """
+        SELECT dimension_type, dimension_value, sentiment_label, term_type, term,
+               count, CAST(share_pct AS CHAR) AS share_pct,
+               CAST(lift_score AS CHAR) AS lift_score
+        FROM analysis_comment_terms
+        WHERE analysis_run_id = :run_id
+          AND dimension_type = :dimension_type
+          AND dimension_value = :dimension_value
+          AND sentiment_label IN ('positive', 'negative')
+          AND term_type = 'word'
+        ORDER BY sentiment_label, count DESC, term
+        """,
+        params,
+    )
+    topic_features = fetch_all(
+        """
+        SELECT dimension_type, dimension_value, sentiment_label, term_type, term,
+               count, CAST(share_pct AS CHAR) AS share_pct,
+               CAST(lift_score AS CHAR) AS lift_score
+        FROM analysis_comment_terms
+        WHERE analysis_run_id = :run_id
+          AND dimension_type = 'query_topic'
+          AND sentiment_label = 'all'
+          AND term_type = 'word'
+          AND lift_score IS NOT NULL
+          AND lift_score > 1
+          AND (:topic_filter IS NULL OR dimension_value = :topic_filter)
+        ORDER BY lift_score DESC, count DESC, term
+        LIMIT 100
+        """,
+        {"run_id": run_id, "topic_filter": topic},
+    )
+    daily = fetch_all(
+        f"""
+        SELECT comment_date, dimension_type, dimension_value, comment_count,
+               distinct_authors, positive_count, neutral_count, negative_count,
+               CAST(net_sentiment_pct AS CHAR) AS net_sentiment_pct
+        FROM analysis_comment_daily_metrics
+        WHERE {" AND ".join(daily_where)}
+        ORDER BY comment_date
+        """,
+        params,
+    )
+    return {
+        "analysisRunId": run_id,
+        "selection": {
+            "dimensionType": dimension_type,
+            "dimensionValue": dimension_value,
+            "sentiment": sentiment,
+        },
+        "metrics": metrics,
+        "selectedMetric": next(
+            (
+                row
+                for row in metrics
+                if row["dimension_type"] == dimension_type
+                and row["dimension_value"] == dimension_value
+            ),
+            None,
+        ),
+        "daily": daily,
+        "terms": terms,
+        "sentimentTerms": sentiment_terms,
+        "topicFeatures": topic_features,
+        "filters": {
+            "runs": fetch_all(
+                """
+                SELECT CAST(id AS CHAR) AS id, completed_at, days
+                FROM analysis_runs WHERE status = 'success'
+                ORDER BY completed_at DESC, id DESC LIMIT 30
+                """
+            ),
+            "topics": fetch_all(
+                """
+                SELECT DISTINCT dimension_value AS topic
+                FROM analysis_comment_metrics
+                WHERE analysis_run_id = :run_id AND dimension_type = 'query_topic'
+                ORDER BY dimension_value
+                """,
+                {"run_id": run_id},
+            ),
+            "videos": fetch_all(
+                """
+                SELECT m.dimension_value AS post_id, p.title, p.thumbnail_url,
+                       c.title AS channel_title, m.comment_count,
+                       CAST(m.net_sentiment_pct AS CHAR) AS net_sentiment_pct
+                FROM analysis_comment_metrics m
+                JOIN posts p ON p.post_id = m.dimension_value
+                JOIN channels c ON c.channel_id = p.channel_id
+                WHERE m.analysis_run_id = :run_id AND m.dimension_type = 'post'
+                ORDER BY m.comment_count DESC
+                """,
+                {"run_id": run_id},
+            ),
+        },
+    }
 
 
 @app.get("/api/collections")
@@ -633,6 +1043,15 @@ def collection_detail(batch_id: str) -> dict[str, Any]:
         LEFT JOIN tracked_queries q ON q.id = r.query_id
         WHERE r.batch_id = :id
         ORDER BY r.id
+        """,
+        {"id": batch_id},
+    )
+    batch["quotaBuckets"] = fetch_all(
+        """
+        SELECT quota_bucket, estimated_units, actual_units
+        FROM collection_quota_usage
+        WHERE batch_id = :id
+        ORDER BY quota_bucket
         """,
         {"id": batch_id},
     )
@@ -685,6 +1104,48 @@ def report_detail(run_id: str, locale: Literal["zh-CN", "ja-JP"] = "zh-CN") -> d
         "markdown": markdown or "",
         "summary": summary.get(actual_locale, summary.get("zh-CN", {})),
     }
+
+
+@app.get("/api/skill-analyses")
+def skill_analyses() -> dict[str, Any]:
+    return {
+        "items": fetch_all(
+            """
+            SELECT CAST(id AS CHAR) AS id, created_at, completed_at, status,
+                   locale, question, title,
+                   CAST(source_batch_id AS CHAR) AS source_batch_id,
+                   CAST(source_analysis_run_id AS CHAR) AS source_analysis_run_id,
+                   window_start, window_end, error_summary
+            FROM skill_analysis_runs
+            ORDER BY created_at DESC, id DESC
+            LIMIT 100
+            """
+        )
+    }
+
+
+@app.get("/api/skill-analyses/{run_id}")
+def skill_analysis_detail(run_id: str) -> dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT CAST(id AS CHAR) AS id, created_at, completed_at, status, locale,
+               question, title, CAST(source_batch_id AS CHAR) AS source_batch_id,
+               CAST(source_analysis_run_id AS CHAR) AS source_analysis_run_id,
+               window_start, window_end, report_markdown, sections_json,
+               charts_json, error_summary
+        FROM skill_analysis_runs
+        WHERE id = :id
+        """,
+        {"id": run_id},
+    )
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "SKILL_ANALYSIS_NOT_FOUND", "message": "Skill analysis was not found"},
+        )
+    row["sections"] = parse_json(row.pop("sections_json"), {})
+    row["charts"] = parse_json(row.pop("charts_json"), [])
+    return row
 
 
 class QueryCreateBody(BaseModel):
@@ -829,6 +1290,74 @@ def copy_query(query_id: str, body: QueryCopyBody) -> dict[str, Any]:
     return create_query(QueryCreateBody(**payload))
 
 
+CandidateStatus = Literal["suggested", "approved", "rejected", "archived", "all"]
+
+
+@app.get("/api/keyword-candidates")
+async def keyword_candidates(status: CandidateStatus = "suggested") -> dict[str, Any]:
+    payload = await asyncio.to_thread(
+        run_node_cli,
+        ["keywords:list", "--status", status],
+    )
+    if not payload.get("ok"):
+        error = payload.get("error") or {}
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": error.get("code", "KEYWORD_CANDIDATES_FAILED"),
+                "message": error.get("message", "Unable to load keyword candidates"),
+            },
+        )
+    return {"items": payload["result"]}
+
+
+@app.post("/api/keyword-candidates/suggest", dependencies=[Depends(require_write_request)])
+async def suggest_keyword_candidates(_: EmptyBody) -> dict[str, Any]:
+    payload = await asyncio.to_thread(run_node_cli, ["keywords:suggest"])
+    if not payload.get("ok"):
+        error = payload.get("error") or {}
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": error.get("code", "KEYWORD_SUGGEST_FAILED"),
+                "message": error.get("message", "Unable to generate keyword candidates"),
+            },
+        )
+    return payload["result"]
+
+
+async def _mutate_keyword_candidate(candidate_id: str, command: str) -> dict[str, Any]:
+    payload = await asyncio.to_thread(
+        run_node_cli,
+        [command, "--id", candidate_id],
+    )
+    if not payload.get("ok"):
+        error = payload.get("error") or {}
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": error.get("code", "KEYWORD_CANDIDATE_MUTATION_FAILED"),
+                "message": error.get("message", "Unable to update keyword candidate"),
+            },
+        )
+    return payload["result"]
+
+
+@app.post("/api/keyword-candidates/{candidate_id}/approve", dependencies=[Depends(require_write_request)])
+async def approve_keyword_candidate(candidate_id: str, _: EmptyBody) -> dict[str, Any]:
+    return await _mutate_keyword_candidate(candidate_id, "keywords:approve")
+
+
+@app.post("/api/keyword-candidates/{candidate_id}/reject", dependencies=[Depends(require_write_request)])
+async def reject_keyword_candidate(candidate_id: str, _: EmptyBody) -> dict[str, Any]:
+    return await _mutate_keyword_candidate(candidate_id, "keywords:reject")
+
+
+@app.post("/api/keyword-candidates/{candidate_id}/archive", dependencies=[Depends(require_write_request)])
+async def archive_keyword_candidate(candidate_id: str, _: EmptyBody) -> dict[str, Any]:
+    return await _mutate_keyword_candidate(candidate_id, "keywords:archive")
+
+
 @app.get("/api/schedule")
 async def schedule_status() -> dict[str, Any]:
     payload = await asyncio.to_thread(run_node_cli, ["schedule:status"])
@@ -839,8 +1368,25 @@ async def schedule_status() -> dict[str, Any]:
 
 
 @app.post("/api/schedule", dependencies=[Depends(require_write_request)])
-async def schedule_install(_: EmptyBody) -> dict[str, Any]:
-    payload = await asyncio.to_thread(run_node_cli, ["schedule:install"])
+async def schedule_install(body: ScheduleInstallBody) -> dict[str, Any]:
+    payload = await asyncio.to_thread(
+        run_node_cli,
+        [
+            "schedule:install",
+            "--hour",
+            str(body.hour),
+            "--minute",
+            str(body.minute),
+            "--frequency",
+            body.frequency,
+            "--mode",
+            body.mode,
+            "--run-analyze",
+            "true" if body.runAnalyze else "false",
+            "--analyze-days",
+            str(body.analyzeDays),
+        ],
+    )
     if not payload.get("ok"):
         error = payload.get("error") or {}
         raise HTTPException(status_code=400, detail={"code": error.get("code", "SCHEDULE_ERROR"), "message": error.get("message", "Unable to install schedule")})

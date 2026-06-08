@@ -79,6 +79,33 @@ async function ensureIndex(connection, database, table, index, definition) {
   }
 }
 
+async function ensurePrimaryKey(connection, database, table, columns) {
+  if (!(await tableExists(connection, database, table))) {
+    return;
+  }
+  const [rows] = await connection.execute(
+    `SELECT column_name
+     FROM information_schema.statistics
+     WHERE table_schema = ? AND table_name = ? AND index_name = 'PRIMARY'
+     ORDER BY seq_in_index`,
+    [database, table],
+  );
+  const current = rows.map((row) => row.column_name);
+  if (current.join(",") === columns.join(",")) {
+    return;
+  }
+  const definition = columns.map((column) => `\`${column}\``).join(", ");
+  if (current.length > 0) {
+    await connection.query(
+      `ALTER TABLE \`${table}\` DROP PRIMARY KEY, ADD PRIMARY KEY (${definition})`,
+    );
+  } else {
+    await connection.query(
+      `ALTER TABLE \`${table}\` ADD PRIMARY KEY (${definition})`,
+    );
+  }
+}
+
 async function ensureForeignKey(
   connection,
   database,
@@ -158,6 +185,46 @@ async function migrateExistingSchema(connection, database) {
     "report_markdown_ja",
     "LONGTEXT NULL AFTER `report_markdown`",
   );
+  await ensureColumn(
+    connection,
+    database,
+    "analysis_comment_terms",
+    "dimension_type",
+    "VARCHAR(32) NOT NULL DEFAULT 'overall' AFTER `analysis_run_id`",
+  );
+  await ensureColumn(
+    connection,
+    database,
+    "analysis_comment_terms",
+    "dimension_value",
+    "VARCHAR(191) NOT NULL DEFAULT 'ALL' AFTER `dimension_type`",
+  );
+  await ensureColumn(
+    connection,
+    database,
+    "analysis_comment_terms",
+    "sentiment_label",
+    "VARCHAR(16) NOT NULL DEFAULT 'all' AFTER `dimension_value`",
+  );
+  await ensureColumn(
+    connection,
+    database,
+    "analysis_comment_terms",
+    "share_pct",
+    "DECIMAL(18,6) NULL AFTER `count`",
+  );
+  await ensureColumn(
+    connection,
+    database,
+    "analysis_comment_terms",
+    "lift_score",
+    "DECIMAL(18,6) NULL AFTER `share_pct`",
+  );
+  if (await tableExists(connection, database, "analysis_comment_terms")) {
+    await connection.query(
+      "ALTER TABLE `analysis_comment_terms` MODIFY `dimension_value` VARCHAR(191) NOT NULL, MODIFY `term` VARCHAR(255) COLLATE utf8mb4_bin NOT NULL",
+    );
+  }
   await ensureIndex(
     connection,
     database,
@@ -186,6 +253,21 @@ async function migrateExistingSchema(connection, database) {
     "fk_analysis_runs_source_batch",
     "CONSTRAINT `fk_analysis_runs_source_batch` FOREIGN KEY (`source_batch_id`) REFERENCES `collection_batches` (`id`) ON DELETE SET NULL",
   );
+  await ensurePrimaryKey(connection, database, "analysis_comment_terms", [
+    "analysis_run_id",
+    "dimension_type",
+    "dimension_value",
+    "sentiment_label",
+    "term_type",
+    "term",
+  ]);
+  await ensureIndex(
+    connection,
+    database,
+    "keyword_candidates",
+    "idx_keyword_candidates_status_score",
+    "KEY `idx_keyword_candidates_status_score` (`status`, `total_score`)",
+  );
 }
 
 export async function initDatabase(config) {
@@ -209,6 +291,22 @@ export async function initDatabase(config) {
     const schemaPath = path.join(config.projectRoot, "sql", "schema.sql");
     const schema = await fs.readFile(schemaPath, "utf8");
     await connection.query(schema);
+    await connection.query(
+      `INSERT IGNORE INTO collection_quota_usage
+        (batch_id, quota_bucket, estimated_units, actual_units)
+       SELECT id, 'standard_units_per_day', estimated_quota_units, actual_quota_units
+       FROM collection_batches`,
+    );
+    await connection.query(
+      `INSERT IGNORE INTO collection_quota_usage
+        (batch_id, quota_bucket, estimated_units, actual_units)
+       SELECT b.id, 'search_requests_per_day',
+              COALESCE(SUM(CASE WHEN r.run_type = 'query_search' THEN r.request_count ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN r.run_type = 'query_search' THEN r.request_count ELSE 0 END), 0)
+       FROM collection_batches b
+       LEFT JOIN collection_runs r ON r.batch_id = b.id
+       GROUP BY b.id`,
+    );
     await connection.query(
       `GRANT SELECT, INSERT, UPDATE, DELETE ON \`${database}\`.* TO ${account}`,
     );
@@ -236,7 +334,9 @@ export async function initDatabase(config) {
           relevance_language = VALUES(relevance_language),
           safe_search = VALUES(safe_search),
           max_results = VALUES(max_results),
-          lookback_days = VALUES(lookback_days)`,
+          lookback_days = VALUES(lookback_days),
+          enabled = TRUE,
+          archived_at = NULL`,
         [name, queryText, topic],
       );
     }
@@ -349,4 +449,32 @@ export async function recordCollectionRun(
       errorSummary,
     ],
   );
+}
+
+export async function recordCollectionQuotaUsage(
+  pool,
+  batchId,
+  estimatedByBucket,
+  actualByBucket,
+) {
+  const buckets = new Set([
+    ...Object.keys(estimatedByBucket ?? {}),
+    ...Object.keys(actualByBucket ?? {}),
+  ]);
+  for (const bucket of buckets) {
+    await pool.execute(
+      `INSERT INTO collection_quota_usage
+        (batch_id, quota_bucket, estimated_units, actual_units)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+        estimated_units = VALUES(estimated_units),
+        actual_units = VALUES(actual_units)`,
+      [
+        batchId,
+        bucket,
+        Number(estimatedByBucket?.[bucket] ?? 0),
+        Number(actualByBucket?.[bucket] ?? 0),
+      ],
+    );
+  }
 }

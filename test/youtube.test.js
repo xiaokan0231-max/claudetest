@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import {
   buildYouTubeApiUrl,
   estimateCollectionQuota,
+  estimateCollectionQuotaBuckets,
+  QUOTA_BUCKETS,
   YouTubeClient,
 } from "../src/youtube.js";
 import { selectThumbnailUrl } from "../src/collector.js";
@@ -30,26 +32,31 @@ test("buildYouTubeApiUrl builds the fixed JP keyword-search parameters", () => {
   assert.equal(url.searchParams.get("maxResults"), "50");
 });
 
-test("estimateCollectionQuota matches the default three-query collection", () => {
+test("estimateCollectionQuota separates search requests from standard units", () => {
   const queries = [
     { max_results: 50 },
     { max_results: 50 },
     { max_results: 50 },
   ];
-  assert.equal(estimateCollectionQuota(queries, 0), 310);
-  assert.equal(estimateCollectionQuota(queries, 30), 312);
+  assert.equal(estimateCollectionQuota(queries, 0), 10);
+  assert.equal(estimateCollectionQuota(queries, 30), 12);
+  assert.deepEqual(estimateCollectionQuotaBuckets(queries, 0), {
+    [QUOTA_BUCKETS.search]: 3,
+    [QUOTA_BUCKETS.standard]: 10,
+  });
 });
 
 test("estimateCollectionQuota adds comment-thread requests", () => {
   const queries = [{ max_results: 50 }, { max_results: 50 }, { max_results: 50 }];
-  assert.equal(estimateCollectionQuota(queries, 0, 40), 350); // 310 + 40 comment pages
+  assert.equal(estimateCollectionQuota(queries, 0, 40), 50);
 });
 
-test("YouTubeClient stops before a request that exceeds the local budget", async () => {
+test("YouTubeClient stops before a search request that exceeds its local bucket budget", async () => {
   let called = false;
   const client = new YouTubeClient({
     apiKey: "not-a-real-key",
-    quotaBudget: 99,
+    quotaBudget: 1000,
+    searchQuotaBudget: 0,
     fetchImpl: async () => {
       called = true;
       throw new Error("should not be called");
@@ -67,7 +74,7 @@ test("YouTubeClient stops before a request that exceeds the local budget", async
       },
       new Date("2026-05-27T00:00:00.000Z"),
     ),
-    /SNS_QUOTA_BUDGET=99/,
+    /SNS_SEARCH_QUOTA_BUDGET=0/,
   );
   assert.equal(called, false);
 });

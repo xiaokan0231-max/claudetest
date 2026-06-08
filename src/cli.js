@@ -5,10 +5,22 @@ import { collect, estimateCollection } from "./collector.js";
 import { getConfig } from "./config.js";
 import { createAppPool, initDatabase } from "./db.js";
 import {
+  approveKeywordCandidate,
+  generateKeywordCandidates,
+  listKeywordCandidates,
+  updateKeywordCandidateStatus,
+} from "./keyword-suggestions.js";
+import { buildQuotaPlan } from "./quota-optimizer.js";
+import {
   installSchedule,
   scheduleStatus,
   uninstallSchedule,
 } from "./scheduler.js";
+import {
+  listSkillAnalyses,
+  saveSkillAnalysis,
+  showSkillAnalysis,
+} from "./skill-analysis.js";
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
@@ -46,11 +58,23 @@ Usage:
   npm run sns -- query:list
   npm run sns -- query:add --name <name> --query <query> --topic <topic>
   npm run sns -- query:disable --name <name>
-  npm run sns -- collect:estimate [--json]
-  npm run sns -- collect [--trigger manual|scheduled|web] [--request-id <uuid>] [--json]
+  npm run sns -- quota:plan [--json]
+  npm run sns -- keywords:suggest [--json]
+  npm run sns -- keywords:list [--status suggested|approved|rejected|archived|all] [--json]
+  npm run sns -- keywords:approve --id <id> [--json]
+  npm run sns -- keywords:reject --id <id> [--json]
+  npm run sns -- keywords:archive --id <id> [--json]
+  npm run sns -- collect:estimate [--mode standard|balanced] [--json]
+  npm run sns -- collect [--mode standard|balanced] [--trigger manual|scheduled|web] [--request-id <uuid>] [--json]
   npm run sns -- analyze [--days 30] [--trigger manual|scheduled|web] [--request-id <uuid>] [--json]
   npm run sns -- report:show [--run-id latest|<id>] [--lang zh|ja]
+  npm run sns -- skill-analysis:save --json
+  npm run sns -- skill-analysis:list [--json]
+  npm run sns -- skill-analysis:show [--run-id latest|<id>] [--json]
   npm run sns -- schedule:install
+    [--hour 7] [--minute 0] [--frequency once|every_12h|every_6h|every_4h|every_2h]
+    [--mode standard|balanced]
+    [--run-analyze true|false] [--analyze-days 30]
   npm run sns -- schedule:status
   npm run sns -- schedule:uninstall
 `);
@@ -72,7 +96,12 @@ function errorCode(error) {
   if (message.includes("YOUTUBE_API_KEY is required")) {
     return "MISSING_API_KEY";
   }
-  if (message.includes("SNS_QUOTA_BUDGET") || message.includes("Estimated collection cost")) {
+  if (
+    message.includes("SNS_QUOTA_BUDGET") ||
+    message.includes("SNS_SEARCH_QUOTA_BUDGET") ||
+    message.includes("Estimated collection cost") ||
+    message.includes("Estimated search cost")
+  ) {
     return "QUOTA_BUDGET_EXCEEDED";
   }
   if (message.includes("YouTube API request failed")) {
@@ -82,6 +111,20 @@ function errorCode(error) {
     return "INVALID_ARGUMENT";
   }
   return "INTERNAL_ERROR";
+}
+
+async function readStdinJson() {
+  let input = "";
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) {
+    input += chunk;
+  }
+  if (!input.trim()) throw new Error("JSON input is required on stdin");
+  try {
+    return JSON.parse(input);
+  } catch {
+    throw new Error("stdin must contain valid JSON");
+  }
 }
 
 async function queryList(config, options) {
@@ -177,6 +220,14 @@ async function reportShow(config, options) {
   }
 }
 
+function collectionMode(options) {
+  const mode = options.mode || "standard";
+  if (!["standard", "balanced"].includes(mode)) {
+    throw new Error("--mode must be standard or balanced");
+  }
+  return mode;
+}
+
 async function main() {
   const { command, options } = parseArgs(process.argv.slice(2));
   if (!command || command === "help" || command === "--help") {
@@ -200,12 +251,57 @@ async function main() {
     case "query:disable":
       await queryDisable(getConfig(), options);
       break;
+    case "quota:plan": {
+      const result = await buildQuotaPlan(getConfig());
+      printResult(options, result, `Balanced plan: ${result.collection.enabledQueryCount} enabled keywords, ${result.candidates.recommendedApprovalCount} candidate approvals recommended.`);
+      break;
+    }
+    case "keywords:suggest": {
+      const result = await generateKeywordCandidates(getConfig());
+      printResult(options, result, `Generated ${result.generatedCount} keyword candidates.`);
+      break;
+    }
+    case "keywords:list": {
+      const result = await listKeywordCandidates(getConfig(), {
+        status: options.status || "suggested",
+      });
+      if (options.json) printResult(options, result);
+      else console.table(result);
+      break;
+    }
+    case "keywords:approve": {
+      const result = await approveKeywordCandidate(
+        getConfig(),
+        requireOption(options, "id"),
+      );
+      printResult(options, result, `Approved candidate ${result.id}: ${result.candidateText}`);
+      break;
+    }
+    case "keywords:reject": {
+      const result = await updateKeywordCandidateStatus(
+        getConfig(),
+        requireOption(options, "id"),
+        "rejected",
+      );
+      printResult(options, result, `Rejected candidate ${result.id}.`);
+      break;
+    }
+    case "keywords:archive": {
+      const result = await updateKeywordCandidateStatus(
+        getConfig(),
+        requireOption(options, "id"),
+        "archived",
+      );
+      printResult(options, result, `Archived candidate ${result.id}.`);
+      break;
+    }
     case "collect:estimate": {
-      const result = await estimateCollection(getConfig());
+      const mode = collectionMode(options);
+      const result = await estimateCollection(getConfig(), { mode });
       printResult(
         options,
         result,
-        `Estimated collection cost: ${result.estimatedQuotaUnits} / ${result.quotaBudget} quota units.`,
+        `Estimated ${mode} collection cost: ${result.estimatedQuotaUnits} / ${result.quotaBudget} quota units.`,
       );
       break;
     }
@@ -218,6 +314,7 @@ async function main() {
       const result = await collect(config, {
         triggerType,
         requestId: options["request-id"] || null,
+        mode: collectionMode(options),
       });
       printResult(
         options,
@@ -256,18 +353,57 @@ async function main() {
     case "report:show":
       await reportShow(getConfig(), options);
       break;
+    case "skill-analysis:save": {
+      const result = await saveSkillAnalysis(getConfig(), await readStdinJson());
+      printResult(
+        options,
+        result,
+        `Saved Skill analysis ${result.id}: ${result.title}`,
+      );
+      break;
+    }
+    case "skill-analysis:list": {
+      const result = await listSkillAnalyses(getConfig());
+      if (options.json) printResult(options, result);
+      else console.table(result);
+      break;
+    }
+    case "skill-analysis:show": {
+      const result = await showSkillAnalysis(
+        getConfig(),
+        options["run-id"] || "latest",
+      );
+      printResult(options, result, result.report_markdown);
+      break;
+    }
     case "schedule:install": {
       const config = getConfig({ requireApiKey: true });
-      const result = await installSchedule(config);
-      printResult(options, result, `Installed daily 07:00 JST schedule: ${result.plistPath}\nLogs: ${result.logDir}`);
+      const result = await installSchedule(config, {
+        hour: options.hour,
+        minute: options.minute,
+        frequency: options.frequency,
+        mode: options.mode,
+        runAnalyze: options["run-analyze"],
+        analyzeDays: options["analyze-days"],
+      });
+      const time = `${String(result.schedule.hour).padStart(2, "0")}:${String(result.schedule.minute).padStart(2, "0")}`;
+      const analysis = result.schedule.runAnalyze
+        ? `analyze ${result.schedule.analyzeDays} days`
+        : "collect only";
+      printResult(
+        options,
+        result,
+        `Installed ${time} JST schedule (${result.schedule.mode}, ${analysis}): ${result.plistPath}\nLogs: ${result.logDir}`,
+      );
       break;
     }
     case "schedule:status": {
-      const result = scheduleStatus();
+      const result = await scheduleStatus();
       const safeResult = {
         installed: result.installed,
         plistPath: result.plistPath,
         logDir: result.logDir,
+        schedule: result.schedule,
       };
       printResult(
         options,

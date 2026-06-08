@@ -7,3 +7,12 @@ web/dist/
 sns-analysis-output/
 *.log
 .DS_Store
+.idea/
+_*.mjs
+
+# Skill is tracked under .agents/skills/; .claude/skills/ is the local copy for Claude Code discovery
+.claude/skills/
+
+# Personal job-search notes — kept local, never published
+テイクス面接対策メモ.md
+適職リスト_データエンジニア求人.md

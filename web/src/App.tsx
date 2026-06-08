@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  Fragment,
   useMemo,
   useState,
   type FormEvent,
@@ -26,12 +27,14 @@ import {
   Languages,
   LoaderCircle,
   Menu,
+  MessageSquareText,
   Play,
   Plus,
   RefreshCw,
   RotateCcw,
   Search,
   Settings2,
+  Sparkles,
   Tag,
   Trash2,
   Video,
@@ -58,15 +61,27 @@ import {
   type Locale,
 } from "./format";
 
-type Page = "overview" | "videos" | "popular" | "collections" | "reports" | "queries";
+type Page =
+  | "overview"
+  | "videos"
+  | "popular"
+  | "quota"
+  | "comments"
+  | "collections"
+  | "reports"
+  | "skillAnalyses"
+  | "queries";
 type Row = Record<string, any>;
 
 const navItems: { id: Page; icon: typeof Home }[] = [
   { id: "overview", icon: Home },
   { id: "videos", icon: Video },
   { id: "popular", icon: Flame },
+  { id: "quota", icon: Database },
+  { id: "comments", icon: MessageSquareText },
   { id: "collections", icon: Clock3 },
   { id: "reports", icon: FileText },
+  { id: "skillAnalyses", icon: Sparkles },
   { id: "queries", icon: Tag },
 ];
 
@@ -133,6 +148,65 @@ function EmptyState({
   );
 }
 
+function QuotaBuckets({
+  quota,
+  locale,
+  compact = false,
+}: {
+  quota: Row | null;
+  locale: Locale;
+  compact?: boolean;
+}) {
+  const { t } = useTranslation();
+  if (!quota || quota.status === "unavailable") {
+    return (
+      <EmptyState
+        title={t("quota.unavailable")}
+        body={quota?.message || t("quota.setupHint")}
+        icon={<Database size={34} />}
+      />
+    );
+  }
+  if (!(quota.buckets ?? []).length) {
+    return <EmptyState title={t("quota.noMetrics")} body={t("quota.noMetricsHint")} />;
+  }
+  return (
+    <div className={`quota-buckets ${compact ? "quota-buckets-compact" : ""}`}>
+      <div className="quota-freshness">
+        <span className={`status-label quota-${quota.status}`}>
+          <StatusDot status={quota.status === "available" ? "success" : "disabled"} />
+          {t(`quota.${quota.status}`)}
+        </span>
+        <span>{t("quota.asOf")}: {formatJst(quota.asOf, locale)}</span>
+      </div>
+      {(quota.buckets ?? []).map((bucket: Row) => {
+        const ratio = Math.min(100, Math.max(0, Number(bucket.usageRatio ?? 0) * 100));
+        return (
+          <div className="quota-bucket" key={bucket.id}>
+            <div className="quota-bucket-head">
+              <div>
+                <strong>{bucket.limitName}</strong>
+                <span>{bucket.quotaMetric}</span>
+              </div>
+              <b>{bucket.remaining == null ? "-" : formatCount(bucket.remaining, locale)} {t("quota.remaining")}</b>
+            </div>
+            <div className="quota-progress"><span style={{ width: `${ratio}%` }} /></div>
+            <div className="quota-bucket-foot">
+              <span>{t("quota.used")} {bucket.used == null ? "-" : formatCount(bucket.used, locale)}</span>
+              <span>{t("quota.limit")} {formatCount(bucket.limit, locale)}</span>
+            </div>
+          </div>
+        );
+      })}
+      {!compact && quota.consoleUrl ? (
+        <a className="text-link" href={quota.consoleUrl} target="_blank" rel="noreferrer">
+          {t("quota.openConsole")}<ExternalLink size={14} />
+        </a>
+      ) : null}
+    </div>
+  );
+}
+
 export function App() {
   const { t, i18n } = useTranslation();
   const locale = useLocale();
@@ -184,7 +258,7 @@ export function App() {
   const openCollect = async () => {
     setError(null);
     try {
-      const data = await api<Row>("/api/actions/collect-estimate");
+      const data = await api<Row>("/api/actions/collect-estimate?mode=balanced");
       setEstimate(data);
       setModal("collect");
     } catch (err) {
@@ -197,7 +271,7 @@ export function App() {
     try {
       const data = await api<{ requestId: string }>(`/api/actions/${kind}`, {
         method: "POST",
-        body: kind === "analyze" ? { days: analyzeDays } : {},
+        body: kind === "analyze" ? { days: analyzeDays } : { mode: "balanced" },
       });
       setActiveAction(data.requestId);
       setModal(null);
@@ -211,8 +285,11 @@ export function App() {
     overview: OverviewPage,
     videos: VideosPage,
     popular: PopularPage,
+    quota: QuotaPage,
+    comments: CommentInsightsPage,
     collections: CollectionsPage,
     reports: ReportsPage,
+    skillAnalyses: SkillAnalysesPage,
     queries: QueriesPage,
   }[page];
 
@@ -304,8 +381,11 @@ export function App() {
             </header>
             {modal === "collect" ? (
               <div className="modal-metrics">
-                <div><span>{t("action.estimate")}</span><strong>{formatCount(estimate?.estimatedQuotaUnits, locale)}</strong></div>
-                <div><span>{t("action.budget")}</span><strong>{formatCount(estimate?.quotaBudget, locale)}</strong></div>
+                <div><span>{t("action.standardEstimate")}</span><strong>{formatCount(estimate?.estimatedQuotaByBucket?.standard_units_per_day, locale)}</strong><small>/ {formatCount(estimate?.quotaBudget, locale)} {t("action.localBudget")}</small></div>
+                <div><span>{t("action.searchEstimate")}</span><strong>{formatCount(estimate?.estimatedQuotaByBucket?.search_requests_per_day, locale)}</strong><small>/ {formatCount(estimate?.searchQuotaBudget, locale)} {t("action.localBudget")}</small></div>
+                <div><span>{t("quotaOptimizer.keywordPlan")}</span><strong>{formatCount(estimate?.queryCount, locale)}</strong><small>{t("quotaOptimizer.enabledKeywords")}</small></div>
+                <div><span>{t("quotaOptimizer.commentPlan")}</span><strong>{formatCount(estimate?.plannedCommentVideos, locale)}</strong><small>{formatCount(estimate?.plannedCommentPages, locale)} {t("quotaOptimizer.pagesEach")}</small></div>
+                <p className="modal-plan-note">{t("action.localEstimateHint")}</p>
               </div>
             ) : (
               <label className="field">
@@ -439,28 +519,6 @@ function OverviewPage({ refreshKey }: { refreshKey: number }) {
     };
   }, [data, locale]);
 
-  const opinionOption = useMemo<EChartsOption>(() => {
-    const topics = data?.opinion?.byTopic ?? [];
-    return {
-      grid: { left: 96, right: 18, top: 22, bottom: 30 },
-      legend: { top: 0, textStyle: { color: "#667085" } },
-      tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
-      xAxis: { type: "value", axisLabel: { color: "#667085" }, splitLine: { lineStyle: { color: "#eef1f5" } } },
-      yAxis: {
-        type: "category",
-        data: topics.map((item: Row) => item.dimension_value).reverse(),
-        axisLine: { show: false },
-        axisTick: { show: false },
-        axisLabel: { color: "#344054", width: 84, overflow: "truncate" },
-      },
-      series: [
-        { name: t("opinion.positive"), type: "bar", stack: "s", itemStyle: { color: "#12b76a" }, data: topics.map((item: Row) => Number(item.positive_count)).reverse() },
-        { name: t("opinion.neutral"), type: "bar", stack: "s", itemStyle: { color: "#98a2b3" }, data: topics.map((item: Row) => Number(item.neutral_count)).reverse() },
-        { name: t("opinion.negative"), type: "bar", stack: "s", itemStyle: { color: "#f04438" }, data: topics.map((item: Row) => Number(item.negative_count)).reverse() },
-      ],
-    };
-  }, [data, t]);
-
   if (!data) return <EmptyState title={t("common.loading")} icon={<LoaderCircle className="spin" size={34} />} />;
   const stats = data.stats ?? {};
   const batch = data.latestBatch ?? {};
@@ -468,7 +526,6 @@ function OverviewPage({ refreshKey }: { refreshKey: number }) {
     [Video, t("overview.sampleVideos"), stats.keyword_sample_videos, ""],
     [Tag, t("overview.queryCount"), stats.query_count, ""],
     [Flame, t("overview.popularCount"), stats.popular_video_count, "Top 50"],
-    [Database, t("overview.quota"), batch.actual_quota_units, `/ ${formatCount(data.quotaBudget, locale)}`],
     [CalendarClock, t("overview.latestBatch"), batch.id ? `#${batch.id}` : "N/A", formatJst(batch.observed_at, locale)],
   ] as const;
 
@@ -534,21 +591,20 @@ function OverviewPage({ refreshKey }: { refreshKey: number }) {
             <Chart option={growthOption} />
           )}
         </Panel>
-        <Panel title={t("overview.quotaUsage")} className="span-4">
-          <div className="quota-summary">
-            <div className="quota-ring"><strong>{formatCount(batch.actual_quota_units, locale)}</strong><span>/ {formatCount(data.quotaBudget, locale)}</span></div>
-            <ul>
-              {(data.quotaBreakdown ?? []).map((item: Row) => (
-                <li key={item.run_type}><span>{item.run_type}</span><b>{item.quota_units}</b></li>
-              ))}
-            </ul>
-          </div>
-        </Panel>
         <Panel title={t("overview.opinion")} subtitle={t("overview.opinionSubtitle")} className="span-4">
-          {(data.opinion?.byTopic?.length ?? 0) === 0 ? (
+          {!data.opinion?.overall ? (
             <EmptyState title={t("common.noData")} />
           ) : (
-            <Chart option={opinionOption} />
+            <div className="opinion-summary">
+              <strong>{formatCount(data.opinion.overall.comment_count, locale)}</strong>
+              <span>{t("comments.analyzedComments")}</span>
+              <div>
+                <b>{t("opinion.positive")}: {formatCount(data.opinion.overall.positive_count, locale)}</b>
+                <b>{t("opinion.neutral")}: {formatCount(data.opinion.overall.neutral_count, locale)}</b>
+                <b>{t("opinion.negative")}: {formatCount(data.opinion.overall.negative_count, locale)}</b>
+              </div>
+              <p className="panel-note">{t("comments.privacyNote")}</p>
+            </div>
           )}
         </Panel>
       </div>
@@ -652,6 +708,26 @@ function VideosPage({ refreshKey }: { refreshKey: number }) {
       data: (data.scatter ?? []).map((item: Row) => [Number(item.latest_views), Number(item.reaction_rate_pct), item.title, item.low_base_reaction_rate]),
     }],
   }), [data.items, locale, t]);
+  const detailGrowthOption = useMemo<EChartsOption>(() => {
+    const rows = detail?.snapshots ?? [];
+    return {
+      grid: { left: 58, right: 18, top: 28, bottom: 44 },
+      legend: { top: 0 },
+      tooltip: { trigger: "axis" },
+      xAxis: { type: "category", data: rows.map((row: Row) => formatJst(row.observed_at, locale, false)), axisLabel: { hideOverlap: true } },
+      yAxis: { type: "value", splitLine: { lineStyle: { color: "#eef1f5" } } },
+      series: [
+        { type: "line", name: t("videos.latestViews"), smooth: true, data: rows.map((row: Row) => Number(row.views ?? 0)), lineStyle: { color: "#2563eb" }, itemStyle: { color: "#2563eb" } },
+        { type: "line", name: t("videos.likes"), smooth: true, data: rows.map((row: Row) => Number(row.likes ?? 0)), lineStyle: { color: "#14a3a8" }, itemStyle: { color: "#14a3a8" } },
+        { type: "line", name: t("videos.comments"), smooth: true, data: rows.map((row: Row) => Number(row.comments ?? 0)), lineStyle: { color: "#f59e0b" }, itemStyle: { color: "#f59e0b" } },
+      ],
+    };
+  }, [detail, locale, t]);
+  const peerMetrics = detail ? [
+    [t("videos.latestViews"), detail.peerComparison?.views, (value: unknown) => formatCount(value, locale)],
+    [t("videos.reactionRate"), detail.peerComparison?.reactionRate, (value: unknown) => formatPercent(value)],
+    [t("videos.dailyGrowth"), detail.peerComparison?.growthPerDay, (value: unknown) => formatCount(value, locale)],
+  ] : [];
 
   return (
     <div>
@@ -692,6 +768,47 @@ function VideosPage({ refreshKey }: { refreshKey: number }) {
         </Panel>
       </div>
 
+      {detail ? (
+        <div className="video-diagnostic-grid">
+          <Panel title={t("videos.growthTimeline")} subtitle={Number(detail.snapshot_count) < 2 ? t("videos.needsMoreSnapshots") : undefined} className="span-6">
+            {Number(detail.snapshot_count) < 2 ? <EmptyState title={t("videos.needsMoreSnapshots")} /> : <Chart option={detailGrowthOption} />}
+          </Panel>
+          <Panel title={t("videos.peerComparison")} subtitle={t("videos.peerSubtitle")} className="span-6">
+            <div className="peer-metrics">
+              {peerMetrics.map(([label, metric, formatter]: any[]) => (
+                <div key={label}>
+                  <span>{label}</span>
+                  <strong>{formatter(metric?.value)}</strong>
+                  <small>{metric?.rank ? t("videos.peerRank", { rank: metric.rank, total: metric.total, percentile: metric.percentile }) : t("common.noData")}</small>
+                  <div className="mini-bar"><i style={{ width: `${Math.max(0, Math.min(100, Number(metric?.percentile ?? 0)))}%` }} /></div>
+                </div>
+              ))}
+            </div>
+          </Panel>
+          <Panel title={t("videos.contentSignals")} subtitle={t("videos.contentSubtitle")} className="span-6">
+            <div className="signal-block">
+              <b>{t("videos.titleTerms")}</b>
+              <div className="tag-list compact-tags">{(detail.contentSignals?.titleTerms ?? []).map((term: string) => <span key={term}>{term}</span>)}</div>
+              <b>{t("videos.matchedQueries")}</b>
+              <div className="tag-list compact-tags">{(detail.queries ?? []).map((query: Row) => <span key={query.id}>{query.query_text}</span>)}</div>
+              <b>{t("videos.tags")}</b>
+              <div className="tag-list compact-tags">{(detail.tags ?? []).slice(0, 18).map((item: Row) => <span key={item.tag}>{item.tag}</span>)}</div>
+            </div>
+          </Panel>
+          <Panel title={t("videos.discoveryPath")} subtitle={t("videos.discoverySubtitle")} className="span-6">
+            <div className="discovery-grid">
+              <div><span>{t("videos.keywordSample")}</span><strong>{detail.contentSignals?.discoverySources?.keywordSample ? t("common.yes") : t("common.no")}</strong><small>{(detail.queries ?? []).map((query: Row) => query.topic).join(", ") || "N/A"}</small></div>
+              <div><span>{t("videos.popularChart")}</span><strong>{detail.contentSignals?.discoverySources?.popularChart ? t("common.yes") : t("common.no")}</strong><small>{detail.popularSummary ? t("videos.popularRankSummary", { best: detail.popularSummary.best_rank, latest: detail.popularSummary.latest_rank, count: detail.popularSummary.appearance_count }) : t("videos.notOnPopular")}</small></div>
+            </div>
+            <div className="popular-history">
+              {(detail.popularHistory ?? []).slice(0, 8).map((row: Row) => (
+                <span key={`${row.batch_id}-${row.rank_position}`}>{formatJst(row.observed_at, locale, false)} · #{row.rank_position}</span>
+              ))}
+            </div>
+          </Panel>
+        </div>
+      ) : null}
+
       <div className="table-wrap">
         <table>
           <thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead>
@@ -721,12 +838,511 @@ function PopularPage({ refreshKey }: { refreshKey: number }) {
   );
 }
 
+function QuotaPage({ refreshKey }: { refreshKey: number }) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  const [quota, setQuota] = useState<Row | null>(null);
+  const [plan, setPlan] = useState<Row | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    const [quotaData, planData] = await Promise.all([
+      api<Row>("/api/system/quota"),
+      api<Row>("/api/quota/plan"),
+    ]);
+    setQuota(quotaData);
+    setPlan(planData);
+  }, []);
+  useEffect(() => { load(); }, [load, refreshKey]);
+
+  const buckets = quota?.buckets ?? [];
+  const dailyBuckets = buckets.filter((item: Row) => item.period === "day");
+  const minuteBuckets = buckets.filter((item: Row) => item.period === "minute");
+  const summary = quota?.summary ?? {};
+  const dailyRatio = Number(summary.dailyUsageRatio ?? 0) * 100;
+
+  if (!quota) return <EmptyState title={t("common.loading")} icon={<LoaderCircle className="spin" size={34} />} />;
+
+  return (
+    <div>
+      <div className="page-heading quota-heading">
+        <div>
+          <h1>{t("quotaPage.title")}</h1>
+          <p>{t("quotaPage.subtitle")}</p>
+        </div>
+        {quota.consoleUrl ? (
+          <a className="secondary-button" href={quota.consoleUrl} target="_blank" rel="noreferrer">
+            <ExternalLink size={16} />{t("quota.openConsole")}
+          </a>
+        ) : null}
+      </div>
+
+      {quota.status === "unavailable" ? (
+        <Panel title={t("quota.unavailable")}>
+          <EmptyState title={quota.message || t("quota.unavailable")} body={t("quota.setupHint")} icon={<Database size={34} />} />
+        </Panel>
+      ) : (
+        <>
+          <div className="quota-summary-grid">
+            <div className="quota-summary-card">
+              <span>{t("quotaPage.dailyTotalLimit")}</span>
+              <strong>{formatCount(summary.dailyLimit, locale)}</strong>
+              <small>{t("quotaPage.dailyTotalHint")}</small>
+            </div>
+            <div className="quota-summary-card">
+              <span>{t("quotaPage.dailyTotalUsed")}</span>
+              <strong>{formatCount(summary.dailyUsed, locale)}</strong>
+              <div className="quota-progress wide"><span style={{ width: `${Math.min(100, Math.max(0, dailyRatio))}%` }} /></div>
+            </div>
+            <div className="quota-summary-card">
+              <span>{t("quotaPage.dailyTotalRemaining")}</span>
+              <strong>{formatCount(summary.dailyRemaining, locale)}</strong>
+              <small>{formatPercent(dailyRatio)} {t("quotaPage.usedPercent")}</small>
+            </div>
+            <div className="quota-summary-card">
+              <span>{t("quotaPage.metricCount")}</span>
+              <strong>{formatCount(summary.bucketCount, locale)}</strong>
+              <small>{t(`quota.${quota.status}`)} · {t("quota.asOf")} {formatJst(quota.asOf, locale)}</small>
+            </div>
+          </div>
+
+          {plan ? (
+            <Panel title={t("quotaOptimizer.title")} subtitle={t("quotaOptimizer.subtitle")} className="quota-plan-panel">
+              <div className="quota-plan-grid">
+                <div>
+                  <span>{t("quotaOptimizer.searchTarget")}</span>
+                  <strong>{formatCount(plan.search?.target, locale)}</strong>
+                  <small>{formatCount(plan.search?.used, locale)} / {formatCount(plan.search?.limit, locale)} {t("quota.used")}</small>
+                </div>
+                <div>
+                  <span>{t("quotaOptimizer.standardTarget")}</span>
+                  <strong>{formatCount(plan.standard?.target, locale)}</strong>
+                  <small>{formatCount(plan.standard?.used, locale)} / {formatCount(plan.standard?.limit, locale)} {t("quota.used")}</small>
+                </div>
+                <div>
+                  <span>{t("quotaOptimizer.safeAvailable")}</span>
+                  <strong>{formatCount(plan.search?.safeAvailable, locale)}</strong>
+                  <small>{t("quotaOptimizer.searchAvailableHint")}</small>
+                </div>
+                <div>
+                  <span>{t("quotaOptimizer.approvalSlots")}</span>
+                  <strong>{formatCount(plan.candidates?.recommendedApprovalCount, locale)}</strong>
+                  <small>{formatCount(plan.candidates?.suggestedCount, locale)} {t("quotaOptimizer.suggestedCandidates")}</small>
+                </div>
+              </div>
+              <div className="quota-plan-detail">
+                <div><b>{t("quotaOptimizer.thisRun")}</b><span>{t("action.searchEstimate")}: {formatCount(plan.collection?.estimatedSearchRequests, locale)} · {t("action.standardEstimate")}: {formatCount(plan.collection?.estimatedStandardUnits, locale)}</span></div>
+                <div><b>{t("quotaOptimizer.commentPlan")}</b><span>{formatCount(plan.collection?.recommendedCommentVideos, locale)} {t("comments.video")} × {formatCount(plan.collection?.recommendedCommentPages, locale)} {t("quotaOptimizer.pagesEach")}</span></div>
+                <p>{plan.messages?.[locale] ?? t("quotaOptimizer.planUnavailable")}</p>
+              </div>
+            </Panel>
+          ) : null}
+
+          <Panel title={t("quotaPage.allMetrics")} subtitle={t("quotaPage.tableHint")}>
+            <div className="quota-table-wrap">
+              <table className="quota-table">
+                <thead>
+                  <tr>
+                    <th>{t("quotaPage.name")}</th>
+                    <th>{t("quotaPage.type")}</th>
+                    <th>{t("quotaPage.dimension")}</th>
+                    <th>{t("quota.limit")}</th>
+                    <th>{t("quotaPage.usagePercent")}</th>
+                    <th>{t("quota.used")}</th>
+                    <th>{t("quota.remaining")}</th>
+                    <th>{t("quotaPage.adjustable")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {buckets.map((bucket: Row) => {
+                    const ratio = Number(bucket.usageRatio ?? 0) * 100;
+                    const isOpen = expanded === bucket.id;
+                    return (
+                      <Fragment key={bucket.id}>
+                        <tr className="quota-row" onClick={() => setExpanded(isOpen ? null : bucket.id)}>
+                          <td>
+                            <strong>{bucket.displayName}</strong>
+                            <small>{bucket.quotaMetric}</small>
+                          </td>
+                          <td>{t("quotaPage.quotaType")}</td>
+                          <td>{t(`quotaPage.${bucket.scope}`)} · {t(`quotaPage.${bucket.period}`)}</td>
+                          <td>{formatCount(bucket.limit, locale)}</td>
+                          <td>
+                            <div className="quota-percent-cell">
+                              <div className="quota-progress"><span style={{ width: `${Math.min(100, Math.max(0, ratio))}%` }} /></div>
+                              <span>{bucket.usageRatio == null ? "-" : formatPercent(ratio)}</span>
+                            </div>
+                          </td>
+                          <td>{bucket.used == null ? "-" : formatCount(bucket.used, locale)}</td>
+                          <td>{bucket.remaining == null ? "-" : formatCount(bucket.remaining, locale)}</td>
+                          <td>{bucket.adjustable ? t("common.yes") : t("common.no")}</td>
+                        </tr>
+                        {isOpen ? (
+                          <tr className="quota-explanation-row">
+                            <td colSpan={8}>
+                              <div className="quota-explanation">
+                                <strong>{t("quotaPage.whatItMeans")}</strong>
+                                <p>{locale === "ja-JP" ? bucket.descriptionJa : bucket.description}</p>
+                                <dl>
+                                  <div><dt>{t("quotaPage.unit")}</dt><dd>{bucket.unit || "-"}</dd></div>
+                                  <div><dt>{t("quotaPage.metric")}</dt><dd>{bucket.quotaMetric}</dd></div>
+                                  <div><dt>{t("quotaPage.defaultLimit")}</dt><dd>{formatCount(bucket.defaultLimit, locale)}</dd></div>
+                                </dl>
+                              </div>
+                            </td>
+                          </tr>
+                        ) : null}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+
+          <div className="dashboard-grid quota-sections">
+            <Panel title={t("quotaPage.dailyMetrics")} className="span-6">
+              {dailyBuckets.length ? <Chart option={rankedBarOption(dailyBuckets.map((item: Row) => ({ ...item, remainingLabel: item.remaining ?? 0 })), "displayName", "remainingLabel", locale, "#1498a3")} /> : <EmptyState title={t("common.noData")} />}
+            </Panel>
+            <Panel title={t("quotaPage.minuteMetrics")} className="span-6">
+              {minuteBuckets.length ? <Chart option={rankedBarOption(minuteBuckets.map((item: Row) => ({ ...item, usedLabel: item.used ?? 0 })), "displayName", "usedLabel", locale, "#f79009")} /> : <EmptyState title={t("common.noData")} />}
+            </Panel>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function rankedBarOption(
+  rows: Row[],
+  labelField: string,
+  valueField: string,
+  locale: Locale,
+  color = "#1769e0",
+): EChartsOption {
+  const items = rows.slice(0, 12).reverse();
+  return {
+    grid: { left: 126, right: 52, top: 18, bottom: 34 },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
+    xAxis: { type: "value", splitLine: { lineStyle: { color: "#eef1f5" } } },
+    yAxis: {
+      type: "category",
+      data: items.map((item) => item[labelField]),
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { width: 116, overflow: "truncate", color: "#344054" },
+    },
+    series: [{
+      type: "bar",
+      data: items.map((item) => Number(item[valueField] ?? 0)),
+      itemStyle: { color, borderRadius: [0, 3, 3, 0] },
+      label: { show: true, position: "right", formatter: (params: any) => formatCount(params.value, locale) },
+    }],
+  };
+}
+
+function liftBarOption(rows: Row[]): EChartsOption {
+  const items = rows.slice(0, 12).reverse();
+  return {
+    grid: { left: 150, right: 58, top: 18, bottom: 34 },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
+    xAxis: { type: "value", min: 1, axisLabel: { formatter: "{value}x" }, splitLine: { lineStyle: { color: "#eef1f5" } } },
+    yAxis: {
+      type: "category",
+      data: items.map((item) => `${item.dimension_value} · ${item.term}`),
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { width: 140, overflow: "truncate", color: "#344054" },
+    },
+    series: [{
+      type: "bar",
+      data: items.map((item) => Number(item.lift_score ?? 0)),
+      itemStyle: { color: "#7f56d9", borderRadius: [0, 3, 3, 0] },
+      label: { show: true, position: "right", formatter: (params: any) => `${Number(params.value).toFixed(2)}x` },
+    }],
+  };
+}
+
+function CommentInsightsPage({ refreshKey }: { refreshKey: number }) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  const [data, setData] = useState<Row | null>(null);
+  const [runId, setRunId] = useState("");
+  const [topic, setTopic] = useState("");
+  const [postId, setPostId] = useState("");
+  const [sentiment, setSentiment] = useState("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+
+  const load = useCallback(async () => {
+    const params = new URLSearchParams();
+    if (runId) params.set("analysis_run_id", runId);
+    if (topic) params.set("topic", topic);
+    if (postId) params.set("post_id", postId);
+    if (sentiment) params.set("sentiment", sentiment);
+    if (dateFrom) params.set("date_from", dateFrom);
+    if (dateTo) params.set("date_to", dateTo);
+    setData(await api<Row>(`/api/comment-insights?${params}`));
+  }, [runId, topic, postId, sentiment, dateFrom, dateTo]);
+  useEffect(() => { load(); }, [load, refreshKey]);
+
+  const terms = data?.terms ?? [];
+  const termRows = (type: string) => terms.filter((item: Row) => item.term_type === type);
+  const sentimentTerms = data?.sentimentTerms ?? [];
+  const positiveWords = sentimentTerms.filter((item: Row) => item.sentiment_label === "positive");
+  const negativeWords = sentimentTerms.filter((item: Row) => item.sentiment_label === "negative");
+  const topicFeatures = data?.topicFeatures ?? [];
+  const metrics = data?.metrics ?? [];
+  const overall = metrics.find((item: Row) => item.dimension_type === "overall");
+  const topicMetrics = metrics.filter((item: Row) => item.dimension_type === "query_topic").slice(0, 10);
+  const videoMetrics = metrics.filter((item: Row) => item.dimension_type === "post").slice(0, 10);
+  const selected = data?.selectedMetric;
+
+  const sentimentOption = useMemo<EChartsOption>(() => ({
+    grid: { left: 84, right: 20, top: 34, bottom: 32 },
+    legend: { top: 0 },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
+    xAxis: { type: "value", max: 100, axisLabel: { formatter: "{value}%" }, splitLine: { lineStyle: { color: "#eef1f5" } } },
+    yAxis: {
+      type: "category",
+      data: topicMetrics.map((item: Row) => item.dimension_value).reverse(),
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { width: 76, overflow: "truncate" },
+    },
+    series: [
+      {
+        name: t("opinion.positive"), type: "bar", stack: "sentiment", itemStyle: { color: "#1498a3" },
+        data: topicMetrics.map((item: Row) => Number(item.comment_count) ? Number(item.positive_count) / Number(item.comment_count) * 100 : 0).reverse(),
+      },
+      {
+        name: t("opinion.neutral"), type: "bar", stack: "sentiment", itemStyle: { color: "#98a2b3" },
+        data: topicMetrics.map((item: Row) => Number(item.comment_count) ? Number(item.neutral_count) / Number(item.comment_count) * 100 : 0).reverse(),
+      },
+      {
+        name: t("opinion.negative"), type: "bar", stack: "sentiment", itemStyle: { color: "#e66b5b" },
+        data: topicMetrics.map((item: Row) => Number(item.comment_count) ? Number(item.negative_count) / Number(item.comment_count) * 100 : 0).reverse(),
+      },
+    ],
+  }), [topicMetrics, t]);
+
+  const dailyOption = useMemo<EChartsOption>(() => {
+    const daily = data?.daily ?? [];
+    const line = daily.length >= 8;
+    return {
+      grid: { left: 58, right: 20, top: 22, bottom: 42 },
+      tooltip: { trigger: "axis" },
+      xAxis: { type: "category", data: daily.map((item: Row) => item.comment_date), axisLabel: { color: "#667085" } },
+      yAxis: { type: "value", splitLine: { lineStyle: { color: "#eef1f5" } } },
+      series: [{
+        type: line ? "line" : "bar",
+        smooth: line,
+        symbolSize: 6,
+        data: daily.map((item: Row) => Number(item.comment_count)),
+        itemStyle: { color: "#1769e0" },
+        lineStyle: { color: "#1769e0", width: 2 },
+      }],
+    };
+  }, [data]);
+
+  if (!data) return <EmptyState title={t("common.loading")} icon={<LoaderCircle className="spin" size={34} />} />;
+  const kpis = [
+    [t("comments.analyzedComments"), selected?.comment_count ?? overall?.comment_count],
+    [t("comments.distinctAuthors"), selected?.distinct_authors ?? overall?.distinct_authors],
+    [t("comments.netSentiment"), formatPercent(selected?.net_sentiment_pct ?? overall?.net_sentiment_pct)],
+    [t("opinion.positive"), selected?.positive_count ?? overall?.positive_count],
+    [t("opinion.negative"), selected?.negative_count ?? overall?.negative_count],
+  ];
+  return (
+    <div>
+      <div className="page-heading"><div><h1>{t("comments.title")}</h1><p>{t("comments.subtitle")}</p></div></div>
+      <div className="filter-bar">
+        <label><span>{t("videos.run")}</span><select value={runId} onChange={(event) => setRunId(event.target.value)}><option value="">{t("common.all")}</option>{(data.filters?.runs ?? []).map((item: Row) => <option key={item.id} value={item.id}>#{item.id} · {formatJst(item.completed_at, locale)}</option>)}</select></label>
+        <label><span>{t("videos.topic")}</span><select value={topic} onChange={(event) => { setTopic(event.target.value); setPostId(""); }}><option value="">{t("common.all")}</option>{(data.filters?.topics ?? []).map((item: Row) => <option key={item.topic}>{item.topic}</option>)}</select></label>
+        <label><span>{t("comments.video")}</span><select value={postId} onChange={(event) => { setPostId(event.target.value); setTopic(""); }}><option value="">{t("common.all")}</option>{(data.filters?.videos ?? []).map((item: Row) => <option key={item.post_id} value={item.post_id}>{item.title}</option>)}</select></label>
+        <label><span>{t("comments.sentiment")}</span><select value={sentiment} onChange={(event) => setSentiment(event.target.value)}><option value="all">{t("common.all")}</option><option value="positive">{t("opinion.positive")}</option><option value="neutral">{t("opinion.neutral")}</option><option value="negative">{t("opinion.negative")}</option></select></label>
+        <label><span>{t("comments.dateFrom")}</span><input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label>
+        <label><span>{t("comments.dateTo")}</span><input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label>
+        <button className="secondary-button compact" onClick={() => { setRunId(""); setTopic(""); setPostId(""); setSentiment("all"); setDateFrom(""); setDateTo(""); }}><RotateCcw size={15} />{t("common.reset")}</button>
+      </div>
+      <div className="kpi-grid comment-kpis">
+        {kpis.map(([label, value]) => <div className="kpi" key={String(label)}><div className="kpi-label"><MessageSquareText size={18} />{label}</div><strong>{typeof value === "string" && value.endsWith("%") ? value : formatCount(value, locale)}</strong></div>)}
+      </div>
+      <div className="dashboard-grid">
+        <Panel title={t("comments.topicSentiment")} subtitle={t("comments.denominator")} className="span-6">
+          {topicMetrics.length ? <Chart option={sentimentOption} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.volumeTrend")} className="span-6">
+          {(data.daily ?? []).length ? <Chart option={dailyOption} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.hotWords")} className="span-4">
+          {termRows("word").length ? <Chart option={rankedBarOption(termRows("word"), "term", "count", locale)} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.hotPhrases")} className="span-4">
+          {termRows("phrase").length ? <Chart option={rankedBarOption(termRows("phrase"), "term", "count", locale, "#1498a3")} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.topicFeatures")} subtitle={t("comments.liftHint")} className="span-4">
+          {topicFeatures.length ? <Chart option={liftBarOption(topicFeatures)} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.positiveWords")} className="span-3">
+          {positiveWords.length ? <Chart option={rankedBarOption(positiveWords, "term", "count", locale, "#1498a3")} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.negativeWords")} className="span-3">
+          {negativeWords.length ? <Chart option={rankedBarOption(negativeWords, "term", "count", locale, "#e66b5b")} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.emojis")} className="span-3">
+          {termRows("emoji").length ? <Chart option={rankedBarOption(termRows("emoji"), "term", "count", locale, "#f79009")} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.hashtags")} className="span-3">
+          {termRows("hashtag").length ? <Chart option={rankedBarOption(termRows("hashtag"), "term", "count", locale, "#7f56d9")} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.videoRanking")} className="span-6">
+          {videoMetrics.length ? <Chart option={rankedBarOption(videoMetrics.map((item: Row) => ({ ...item, label: data.filters?.videos?.find((video: Row) => video.post_id === item.dimension_value)?.title ?? item.dimension_value })), "label", "comment_count", locale, "#1498a3")} /> : <EmptyState title={t("common.noData")} />}
+        </Panel>
+        <Panel title={t("comments.quality")} className="span-12">
+          <div className="quality-note"><CircleAlert size={18} /><p>{t("comments.privacyNote")}</p></div>
+        </Panel>
+      </div>
+    </div>
+  );
+}
+
+function skillChartOption(chart: Row, locale: Locale): EChartsOption {
+  const fields = chart.fields ?? {};
+  const rows = chart.rows ?? [];
+  if (chart.type === "scatter") {
+    return {
+      grid: { left: 58, right: 22, top: 24, bottom: 44 },
+      tooltip: { formatter: (params: any) => `${params.data[2] ?? ""}<br/>${params.data[0]} · ${params.data[1]}` },
+      xAxis: { type: "value", splitLine: { lineStyle: { color: "#eef1f5" } } },
+      yAxis: { type: "value", splitLine: { lineStyle: { color: "#eef1f5" } } },
+      series: [{ type: "scatter", itemStyle: { color: "#1769e0" }, data: rows.map((row: Row) => [Number(row[fields.x]), Number(row[fields.y]), row[fields.label]]) }],
+    };
+  }
+  if (chart.type === "line") {
+    const seriesNames: string[] = fields.series
+      ? Array.from(new Set<string>(rows.map((row: Row) => String(row[fields.series]))))
+      : [String(chart.title)];
+    const categories: string[] = Array.from(
+      new Set<string>(rows.map((row: Row) => String(row[fields.x]))),
+    );
+    return {
+      grid: { left: 58, right: 22, top: 24, bottom: 44 },
+      tooltip: { trigger: "axis" },
+      legend: { top: 0 },
+      xAxis: { type: "category", data: categories },
+      yAxis: { type: "value", splitLine: { lineStyle: { color: "#eef1f5" } } },
+      series: seriesNames.map((name, index) => ({
+        name,
+        type: "line",
+        data: rows.filter((row: Row) => !fields.series || String(row[fields.series]) === name).map((row: Row) => Number(row[fields.y])),
+        color: ["#1769e0", "#1498a3", "#f79009", "#7f56d9"][index % 4],
+      })),
+    };
+  }
+  if (chart.type === "stackedBar") {
+    const categories: string[] = Array.from(new Set<string>(rows.map((row: Row) => String(row[fields.x]))));
+    const seriesNames: string[] = Array.from(new Set<string>(rows.map((row: Row) => String(row[fields.series]))));
+    return {
+      grid: { left: 110, right: 22, top: 34, bottom: 38 },
+      tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
+      legend: { top: 0 },
+      xAxis: { type: "value", splitLine: { lineStyle: { color: "#eef1f5" } } },
+      yAxis: { type: "category", data: categories },
+      series: seriesNames.map((name, index) => ({
+        name,
+        type: "bar",
+        stack: "total",
+        data: categories.map((category) => Number(rows.find((row: Row) => String(row[fields.x]) === category && String(row[fields.series]) === name)?.[fields.y] ?? 0)),
+        color: ["#1769e0", "#1498a3", "#f79009", "#98a2b3"][index % 4],
+      })),
+    };
+  }
+  return rankedBarOption(rows, fields.x || fields.label, fields.y || fields.value, locale);
+}
+
+function SkillAnalysesPage({ refreshKey }: { refreshKey: number }) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  const [items, setItems] = useState<Row[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [detail, setDetail] = useState<Row | null>(null);
+  useEffect(() => {
+    api<Row>("/api/skill-analyses").then((data) => {
+      setItems(data.items);
+      if (!selected && data.items[0]) setSelected(data.items[0].id);
+    });
+  }, [refreshKey, selected]);
+  useEffect(() => {
+    if (selected) api<Row>(`/api/skill-analyses/${selected}`).then(setDetail);
+  }, [selected, refreshKey]);
+  return (
+    <div>
+      <div className="page-heading"><div><h1>{t("skill.title")}</h1><p>{t("skill.subtitle")}</p></div></div>
+      <div className="report-layout">
+        <Panel title={t("skill.history")} className="report-history">
+          <div className="run-list">{items.map((item) => <button key={item.id} className={selected === item.id ? "run-selected" : ""} onClick={() => setSelected(item.id)}><span><StatusDot status={item.status} />#{item.id} · {item.title}</span><small>{formatJst(item.completed_at || item.created_at, locale)}</small></button>)}</div>
+        </Panel>
+        <div className="skill-detail">
+          {detail ? (
+            <>
+              <Panel title={detail.title} subtitle={detail.question}>
+                <div className="skill-meta">
+                  <span>{t("skill.sourceAnalysis")}: {detail.source_analysis_run_id ? `#${detail.source_analysis_run_id}` : "N/A"}</span>
+                  <span>{t("skill.sourceBatch")}: {detail.source_batch_id ? `#${detail.source_batch_id}` : "N/A"}</span>
+                  <span>{t("skill.window")}: {formatJst(detail.window_start, locale, false)} - {formatJst(detail.window_end, locale, false)}</span>
+                </div>
+                <article className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{detail.report_markdown}</ReactMarkdown></article>
+              </Panel>
+              {(detail.charts ?? []).map((chart: Row, index: number) => (
+                <Panel key={`${chart.title}-${index}`} title={chart.title} subtitle={chart.subtitle}>
+                  {chart.type === "table" ? (
+                    <div className="table-wrap flat"><table><thead><tr>{Object.keys(chart.rows?.[0] ?? {}).map((key) => <th key={key}>{key}</th>)}</tr></thead><tbody>{(chart.rows ?? []).map((row: Row, rowIndex: number) => <tr key={rowIndex}>{Object.keys(chart.rows?.[0] ?? {}).map((key) => <td key={key}>{String(row[key] ?? "")}</td>)}</tr>)}</tbody></table></div>
+                  ) : <Chart option={skillChartOption(chart, locale)} />}
+                </Panel>
+              ))}
+            </>
+          ) : <Panel title={t("skill.title")}><EmptyState title={t("common.noData")} body={t("skill.emptyHint")} /></Panel>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const FREQ_OPTIONS = [
+  { value: "once",       step: 24 },
+  { value: "every_12h", step: 12 },
+  { value: "every_6h",  step: 6  },
+  { value: "every_4h",  step: 4  },
+  { value: "every_2h",  step: 2  },
+] as const;
+
+function computeTriggerTimes(hour: number, minute: number, frequency: string): string[] {
+  const step = FREQ_OPTIONS.find((o) => o.value === frequency)?.step ?? 24;
+  const count = step >= 24 ? 1 : 24 / step;
+  const times: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const h = (hour + i * step) % 24;
+    times.push(`${String(h).padStart(2, "0")}:${String(minute).padStart(2, "0")}`);
+  }
+  return times;
+}
+
 function CollectionsPage({ refreshKey }: { refreshKey: number }) {
   const { t } = useTranslation();
   const locale = useLocale();
   const [items, setItems] = useState<Row[]>([]);
   const [selected, setSelected] = useState<Row | null>(null);
   const [schedule, setSchedule] = useState<Row | null>(null);
+  const [scheduleForm, setScheduleForm] = useState({
+    hour: 7,
+    minute: 0,
+    frequency: "once",
+    mode: "balanced",
+    runAnalyze: true,
+    analyzeDays: 30,
+  });
 
   const load = useCallback(async () => {
     const [history, status] = await Promise.all([api<Row>("/api/collections"), api<Row>("/api/schedule")]);
@@ -734,18 +1350,113 @@ function CollectionsPage({ refreshKey }: { refreshKey: number }) {
     setSchedule(status);
   }, []);
   useEffect(() => { load(); }, [load, refreshKey]);
+  useEffect(() => {
+    if (schedule?.schedule) {
+      setScheduleForm({
+        hour: Number(schedule.schedule.hour ?? 7),
+        minute: Number(schedule.schedule.minute ?? 0),
+        frequency: schedule.schedule.frequency ?? "once",
+        mode: schedule.schedule.mode === "standard" ? "standard" : "balanced",
+        runAnalyze: Boolean(schedule.schedule.runAnalyze ?? true),
+        analyzeDays: Number(schedule.schedule.analyzeDays ?? 30),
+      });
+    }
+  }, [schedule]);
 
-  const toggleSchedule = async () => {
-    await api<Row>("/api/schedule", { method: schedule?.installed ? "DELETE" : "POST", body: {} });
+  const saveSchedule = async () => {
+    await api<Row>("/api/schedule", { method: "POST", body: scheduleForm });
+    await load();
+  };
+  const uninstallSchedule = async () => {
+    await api<Row>("/api/schedule", { method: "DELETE", body: {} });
     await load();
   };
   const showDetail = async (id: string) => setSelected(await api<Row>(`/api/collections/${id}`));
+  const triggerTimes = computeTriggerTimes(scheduleForm.hour, scheduleForm.minute, scheduleForm.frequency);
+  const triggerTimesStr = triggerTimes.join("  ·  ");
 
   return (
     <div>
       <div className="page-heading"><div><h1>{t("collections.title")}</h1></div></div>
-      <Panel title={t("collections.schedule")} subtitle={t("collections.scheduleBody")} action={<button className={schedule?.installed ? "secondary-button" : "primary-button"} onClick={toggleSchedule}>{schedule?.installed ? <Trash2 size={16} /> : <CalendarClock size={16} />}{schedule?.installed ? t("collections.uninstall") : t("collections.install")}</button>}>
-        <div className="schedule-status"><StatusDot status={schedule?.installed ? "success" : "disabled"} /><strong>{schedule?.installed ? t("collections.installed") : t("collections.notInstalled")}</strong></div>
+      <Panel
+        title={t("collections.schedule")}
+        subtitle={t("collections.scheduleBody")}
+        action={
+          <div className="panel-actions">
+            {schedule?.installed ? (
+              <button className="secondary-button" onClick={uninstallSchedule}><Trash2 size={16} />{t("collections.uninstall")}</button>
+            ) : null}
+            <button className="primary-button" onClick={saveSchedule}><CalendarClock size={16} />{schedule?.installed ? t("collections.updateSchedule") : t("collections.install")}</button>
+          </div>
+        }
+      >
+        <div className="schedule-config">
+          <div className="schedule-status">
+            <StatusDot status={schedule?.installed ? "success" : "disabled"} />
+            <strong>{schedule?.installed ? t("collections.installed") : t("collections.notInstalled")}</strong>
+            <span>{t("collections.triggerTimes", { times: triggerTimesStr })}</span>
+          </div>
+          <div className="schedule-form">
+            <label>
+              <span>{t("collections.scheduleTime")}</span>
+              <div className="time-inputs">
+                <input
+                  type="number"
+                  min={0}
+                  max={23}
+                  value={scheduleForm.hour}
+                  onChange={(event) => setScheduleForm((current) => ({ ...current, hour: Number(event.target.value) }))}
+                />
+                <strong>:</strong>
+                <input
+                  type="number"
+                  min={0}
+                  max={59}
+                  value={scheduleForm.minute}
+                  onChange={(event) => setScheduleForm((current) => ({ ...current, minute: Number(event.target.value) }))}
+                />
+              </div>
+            </label>
+            <label>
+              <span>{t("collections.frequency")}</span>
+              <select value={scheduleForm.frequency} onChange={(event) => setScheduleForm((current) => ({ ...current, frequency: event.target.value }))}>
+                <option value="once">{t("collections.freqOnce")}</option>
+                <option value="every_12h">{t("collections.freqEvery12h")}</option>
+                <option value="every_6h">{t("collections.freqEvery6h")}</option>
+                <option value="every_4h">{t("collections.freqEvery4h")}</option>
+                <option value="every_2h">{t("collections.freqEvery2h")}</option>
+              </select>
+            </label>
+            <label>
+              <span>{t("collections.collectMode")}</span>
+              <select value={scheduleForm.mode} onChange={(event) => setScheduleForm((current) => ({ ...current, mode: event.target.value }))}>
+                <option value="balanced">{t("collections.modeBalanced")}</option>
+                <option value="standard">{t("collections.modeStandard")}</option>
+              </select>
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={scheduleForm.runAnalyze}
+                onChange={(event) => setScheduleForm((current) => ({ ...current, runAnalyze: event.target.checked }))}
+              />
+              <span>{t("collections.runAnalyze")}</span>
+            </label>
+            <label>
+              <span>{t("collections.analyzeDays")}</span>
+              <select
+                value={scheduleForm.analyzeDays}
+                disabled={!scheduleForm.runAnalyze}
+                onChange={(event) => setScheduleForm((current) => ({ ...current, analyzeDays: Number(event.target.value) }))}
+              >
+                <option value={7}>7</option>
+                <option value={30}>30</option>
+                <option value={90}>90</option>
+              </select>
+            </label>
+          </div>
+          <p className="schedule-help">{t("collections.scheduleHelp")}</p>
+        </div>
       </Panel>
       <div className="table-wrap">
         <table>
@@ -792,12 +1503,16 @@ function ReportsPage({ refreshKey }: { refreshKey: number }) {
 
 function QueriesPage({ refreshKey }: { refreshKey: number }) {
   const { t } = useTranslation();
+  const locale = useLocale();
   const [items, setItems] = useState<Row[]>([]);
+  const [candidates, setCandidates] = useState<Row[]>([]);
+  const [candidateLoading, setCandidateLoading] = useState(false);
   const [form, setForm] = useState({ name: "", query_text: "", topic: "", max_results: 50, lookback_days: 7 });
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => api<Row>("/api/queries").then((data) => setItems(data.items)), []);
-  useEffect(() => { load(); }, [load, refreshKey]);
+  const loadCandidates = useCallback(() => api<Row>("/api/keyword-candidates?status=suggested").then((data) => setCandidates(data.items)), []);
+  useEffect(() => { load(); loadCandidates(); }, [load, loadCandidates, refreshKey]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -818,6 +1533,26 @@ function QueriesPage({ refreshKey }: { refreshKey: number }) {
       setError(localizedError(err, t));
     }
   };
+  const generateCandidates = async () => {
+    setCandidateLoading(true);
+    setError(null);
+    try {
+      await api<Row>("/api/keyword-candidates/suggest", { method: "POST", body: {} });
+      await loadCandidates();
+    } catch (err) {
+      setError(localizedError(err, t));
+    } finally {
+      setCandidateLoading(false);
+    }
+  };
+  const mutateCandidate = async (id: string, action: "approve" | "reject" | "archive") => {
+    try {
+      await api<Row>(`/api/keyword-candidates/${id}/${action}`, { method: "POST", body: {} });
+      await Promise.all([load(), loadCandidates()]);
+    } catch (err) {
+      setError(localizedError(err, t));
+    }
+  };
 
   return (
     <div>
@@ -832,6 +1567,50 @@ function QueriesPage({ refreshKey }: { refreshKey: number }) {
           <label><span>{t("queries.lookback")}</span><input type="number" min={1} max={30} value={form.lookback_days} onChange={(event) => setForm({ ...form, lookback_days: Number(event.target.value) })} /></label>
           <button className="primary-button" type="submit"><Plus size={16} />{t("common.create")}</button>
         </form>
+      </Panel>
+      <Panel
+        title={t("keywordCandidates.title")}
+        subtitle={t("keywordCandidates.subtitle")}
+        action={(
+          <button className="secondary-button" onClick={generateCandidates} disabled={candidateLoading}>
+            {candidateLoading ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}
+            {t("keywordCandidates.generate")}
+          </button>
+        )}
+        className="candidate-panel"
+      >
+        {candidates.length === 0 ? (
+          <EmptyState title={t("keywordCandidates.empty")} body={t("keywordCandidates.emptyHint")} icon={<Sparkles size={34} />} />
+        ) : (
+          <div className="candidate-grid">
+            {candidates.slice(0, 12).map((candidate) => (
+              <article className="candidate-card" key={candidate.id}>
+                <div className="candidate-card-head">
+                  <strong>{candidate.candidate_text}</strong>
+                  <span>{Number(candidate.total_score ?? 0).toFixed(1)}</span>
+                </div>
+                <div className="candidate-meta">
+                  <span>{candidate.topic}</span>
+                  <span>{t(`keywordCandidates.source.${candidate.source_type}`, { defaultValue: candidate.source_type })}</span>
+                </div>
+                <p>{candidate.reason_text}</p>
+                <dl>
+                  <div><dt>{t("keywordCandidates.heat")}</dt><dd>{Number(candidate.heat_score ?? 0).toFixed(1)}</dd></div>
+                  <div><dt>{t("keywordCandidates.comment")}</dt><dd>{Number(candidate.comment_score ?? 0).toFixed(1)}</dd></div>
+                  <div><dt>{t("keywordCandidates.relevance")}</dt><dd>{Number(candidate.relevance_score ?? 0).toFixed(1)}</dd></div>
+                </dl>
+                <footer>
+                  <small>{t("keywordCandidates.lastSeen")}: {formatJst(candidate.last_seen_at, locale)}</small>
+                  <div className="row-actions">
+                    <button className="icon-button" title={t("keywordCandidates.approve")} onClick={() => mutateCandidate(candidate.id, "approve")}><CheckCircle2 size={16} /></button>
+                    <button className="icon-button" title={t("keywordCandidates.reject")} onClick={() => mutateCandidate(candidate.id, "reject")}><X size={16} /></button>
+                    <button className="icon-button" title={t("common.archive")} onClick={() => mutateCandidate(candidate.id, "archive")}><Archive size={16} /></button>
+                  </div>
+                </footer>
+              </article>
+            ))}
+          </div>
+        )}
       </Panel>
       <div className="table-wrap">
         <table>

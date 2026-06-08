@@ -18,6 +18,43 @@ CREATE TABLE IF NOT EXISTS tracked_queries (
   CONSTRAINT chk_tracked_queries_lookback_days CHECK (lookback_days BETWEEN 1 AND 30)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS keyword_candidates (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  candidate_text VARCHAR(191) NOT NULL,
+  normalized_text VARCHAR(191) NOT NULL,
+  topic VARCHAR(191) NOT NULL DEFAULT '生成AI',
+  source_type VARCHAR(32) NOT NULL,
+  source_ref_type VARCHAR(32) NULL,
+  source_ref_id VARCHAR(191) NULL,
+  source_title VARCHAR(1000) NULL,
+  heat_score DECIMAL(10,4) NOT NULL DEFAULT 0,
+  comment_score DECIMAL(10,4) NOT NULL DEFAULT 0,
+  growth_score DECIMAL(10,4) NOT NULL DEFAULT 0,
+  relevance_score DECIMAL(10,4) NOT NULL DEFAULT 0,
+  freshness_score DECIMAL(10,4) NOT NULL DEFAULT 0,
+  total_score DECIMAL(10,4) NOT NULL DEFAULT 0,
+  reason_text VARCHAR(1000) NOT NULL,
+  evidence_json JSON NULL,
+  status VARCHAR(16) NOT NULL DEFAULT 'suggested',
+  tracked_query_id BIGINT UNSIGNED NULL,
+  first_seen_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  last_seen_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  approved_at DATETIME(6) NULL,
+  rejected_at DATETIME(6) NULL,
+  archived_at DATETIME(6) NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_keyword_candidates_normalized (normalized_text),
+  KEY idx_keyword_candidates_status_score (status, total_score),
+  KEY idx_keyword_candidates_topic (topic),
+  KEY idx_keyword_candidates_tracked_query (tracked_query_id),
+  CONSTRAINT fk_keyword_candidates_tracked_query
+    FOREIGN KEY (tracked_query_id) REFERENCES tracked_queries(id) ON DELETE SET NULL,
+  CONSTRAINT chk_keyword_candidates_status
+    CHECK (status IN ('suggested', 'approved', 'rejected', 'archived'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS collection_batches (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   started_at DATETIME(6) NOT NULL,
@@ -55,6 +92,18 @@ CREATE TABLE IF NOT EXISTS collection_runs (
     FOREIGN KEY (batch_id) REFERENCES collection_batches(id) ON DELETE CASCADE,
   CONSTRAINT fk_collection_runs_query
     FOREIGN KEY (query_id) REFERENCES tracked_queries(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS collection_quota_usage (
+  batch_id BIGINT UNSIGNED NOT NULL,
+  quota_bucket VARCHAR(64) NOT NULL,
+  estimated_units INT UNSIGNED NOT NULL DEFAULT 0,
+  actual_units INT UNSIGNED NOT NULL DEFAULT 0,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (batch_id, quota_bucket),
+  KEY idx_collection_quota_usage_bucket (quota_bucket, batch_id),
+  CONSTRAINT fk_collection_quota_usage_batch
+    FOREIGN KEY (batch_id) REFERENCES collection_batches(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS channels (
@@ -383,13 +432,67 @@ CREATE TABLE IF NOT EXISTS analysis_comment_metrics (
 
 CREATE TABLE IF NOT EXISTS analysis_comment_terms (
   analysis_run_id BIGINT UNSIGNED NOT NULL,
+  dimension_type VARCHAR(32) NOT NULL,
+  dimension_value VARCHAR(191) NOT NULL,
+  sentiment_label VARCHAR(16) NOT NULL DEFAULT 'all',
   term_type VARCHAR(16) NOT NULL,
-  term VARCHAR(255) NOT NULL,
+  term VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,
   count INT UNSIGNED NOT NULL,
-  PRIMARY KEY (analysis_run_id, term_type, term),
-  KEY idx_analysis_comment_terms_rank (analysis_run_id, term_type, count),
+  share_pct DECIMAL(18,6) NULL,
+  lift_score DECIMAL(18,6) NULL,
+  PRIMARY KEY (
+    analysis_run_id, dimension_type, dimension_value,
+    sentiment_label, term_type, term
+  ),
+  KEY idx_analysis_comment_terms_rank (
+    analysis_run_id, dimension_type, dimension_value,
+    sentiment_label, term_type, count
+  ),
   CONSTRAINT fk_analysis_comment_terms_run
     FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS analysis_comment_daily_metrics (
+  analysis_run_id BIGINT UNSIGNED NOT NULL,
+  comment_date DATE NOT NULL,
+  dimension_type VARCHAR(32) NOT NULL,
+  dimension_value VARCHAR(500) NOT NULL,
+  comment_count INT UNSIGNED NOT NULL,
+  distinct_authors INT UNSIGNED NOT NULL,
+  positive_count INT UNSIGNED NOT NULL,
+  neutral_count INT UNSIGNED NOT NULL,
+  negative_count INT UNSIGNED NOT NULL,
+  net_sentiment_pct DECIMAL(18,6) NULL,
+  PRIMARY KEY (analysis_run_id, comment_date, dimension_type, dimension_value),
+  KEY idx_analysis_comment_daily_date (analysis_run_id, comment_date),
+  CONSTRAINT fk_analysis_comment_daily_run
+    FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS skill_analysis_runs (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  completed_at DATETIME(6) NULL,
+  status VARCHAR(32) NOT NULL,
+  locale VARCHAR(16) NOT NULL DEFAULT 'zh-CN',
+  question TEXT NOT NULL,
+  title VARCHAR(500) NOT NULL,
+  source_batch_id BIGINT UNSIGNED NULL,
+  source_analysis_run_id BIGINT UNSIGNED NULL,
+  window_start DATETIME(6) NULL,
+  window_end DATETIME(6) NULL,
+  report_markdown LONGTEXT NULL,
+  sections_json JSON NULL,
+  charts_json JSON NULL,
+  error_summary TEXT NULL,
+  PRIMARY KEY (id),
+  KEY idx_skill_analysis_runs_created_at (created_at),
+  KEY idx_skill_analysis_runs_status (status),
+  KEY idx_skill_analysis_runs_source_analysis (source_analysis_run_id),
+  CONSTRAINT fk_skill_analysis_runs_source_batch
+    FOREIGN KEY (source_batch_id) REFERENCES collection_batches(id) ON DELETE SET NULL,
+  CONSTRAINT fk_skill_analysis_runs_source_analysis
+    FOREIGN KEY (source_analysis_run_id) REFERENCES analysis_runs(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE OR REPLACE VIEW v_latest_post_metrics AS

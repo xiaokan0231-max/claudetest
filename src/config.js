@@ -42,6 +42,7 @@ export function getConfig({ requireApiKey = false } = {}) {
     youtubeApiKey,
     timezone: process.env.SNS_TIMEZONE || "Asia/Tokyo",
     quotaBudget: integerEnv("SNS_QUOTA_BUDGET", 1000, { min: 1 }),
+    searchQuotaBudget: integerEnv("SNS_SEARCH_QUOTA_BUDGET", 100, { min: 1 }),
     activeWindowDays: integerEnv("SNS_ACTIVE_WINDOW_DAYS", 30, { min: 1 }),
     commentFetch: {
       enabled: (process.env.SNS_COLLECT_COMMENTS || "false").toLowerCase() === "true",

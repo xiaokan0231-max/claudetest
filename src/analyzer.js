@@ -14,7 +14,12 @@ import {
   toMysqlDateTime,
 } from "./utils.js";
 import { scoreSentiment } from "./sentiment.js";
-import { buildCommentTerms } from "./text.js";
+import {
+  buildBigrams,
+  extractEmojis,
+  extractHashtags,
+  tokenize,
+} from "./text.js";
 
 function groupBy(items, keyFn) {
   const output = new Map();
@@ -355,6 +360,190 @@ export function buildCommentMetrics(commentRows) {
   };
 }
 
+function commentDimensions(row) {
+  const dimensions = [{ type: "overall", value: "ALL" }];
+  const topics = String(row.topics ?? "")
+    .split("||")
+    .map((topic) => normalizeDimensionValue(topic))
+    .filter(Boolean);
+  for (const topic of topics) {
+    dimensions.push({ type: "query_topic", value: topic });
+  }
+  if (row.post_id) {
+    dimensions.push({
+      type: "post",
+      value: String(row.post_id),
+      label: row.post_title || row.post_id,
+    });
+  }
+  return dimensions;
+}
+
+function metricBucket(map, type, value, date = null) {
+  const key = `${date ?? ""}\u0000${buildDimensionKey(type, value)}`;
+  if (!map.has(key)) {
+    map.set(key, {
+      dimensionType: type,
+      dimensionValue: value,
+      commentDate: date,
+      authors: new Set(),
+      commentCount: 0,
+      positive: 0,
+      neutral: 0,
+      negative: 0,
+    });
+  }
+  return map.get(key);
+}
+
+function finalizeCommentMetric(bucket) {
+  return {
+    dimensionType: bucket.dimensionType,
+    dimensionValue: bucket.dimensionValue,
+    commentDate: bucket.commentDate,
+    commentCount: bucket.commentCount,
+    distinctAuthors: bucket.authors.size,
+    positive: bucket.positive,
+    neutral: bucket.neutral,
+    negative: bucket.negative,
+    netSentimentPct:
+      bucket.commentCount > 0
+        ? ((bucket.positive - bucket.negative) / bucket.commentCount) * 100
+        : null,
+  };
+}
+
+function bumpTerm(termBuckets, dimension, sentiment, type, term) {
+  if (!term) return;
+  const key = `${buildDimensionKey(dimension.type, dimension.value)}\u0000${sentiment}\u0000${type}`;
+  if (!termBuckets.has(key)) {
+    termBuckets.set(key, {
+      dimensionType: dimension.type,
+      dimensionValue: dimension.value,
+      sentimentLabel: sentiment,
+      termType: type,
+      counts: new Map(),
+      total: 0,
+    });
+  }
+  const bucket = termBuckets.get(key);
+  bucket.counts.set(term, (bucket.counts.get(term) ?? 0) + 1);
+  bucket.total += 1;
+}
+
+function topTermRows(termBuckets, limitByType = {}) {
+  const overallShares = new Map();
+  for (const bucket of termBuckets.values()) {
+    if (
+      bucket.dimensionType !== "overall" ||
+      bucket.dimensionValue !== "ALL" ||
+      bucket.sentimentLabel !== "all"
+    ) {
+      continue;
+    }
+    for (const [term, count] of bucket.counts) {
+      overallShares.set(
+        `${bucket.termType}\u0000${term}`,
+        bucket.total > 0 ? count / bucket.total : 0,
+      );
+    }
+  }
+  const rows = [];
+  for (const bucket of termBuckets.values()) {
+    const limit =
+      limitByType[bucket.termType] ??
+      (bucket.termType === "word" ? 40 : bucket.termType === "phrase" ? 30 : 15);
+    const ranked = [...bucket.counts.entries()]
+      .sort(
+        (left, right) =>
+          right[1] - left[1] || left[0].localeCompare(right[0], "ja"),
+      )
+      .slice(0, limit);
+    for (const [term, count] of ranked) {
+      const share = bucket.total > 0 ? count / bucket.total : 0;
+      const overallShare = overallShares.get(`${bucket.termType}\u0000${term}`) ?? 0;
+      rows.push({
+        dimensionType: bucket.dimensionType,
+        dimensionValue: bucket.dimensionValue,
+        sentimentLabel: bucket.sentimentLabel,
+        termType: bucket.termType,
+        term,
+        count,
+        sharePct: share * 100,
+        liftScore:
+          bucket.dimensionType !== "overall" && overallShare > 0
+            ? share / overallShare
+            : null,
+      });
+    }
+  }
+  return rows;
+}
+
+// Build materialized comment insights without external NLP services.
+export function buildCommentInsights(commentRows) {
+  const metricBuckets = new Map();
+  const dailyBuckets = new Map();
+  const termBuckets = new Map();
+  for (const row of commentRows ?? []) {
+    const sentiment = scoreSentiment(row.text_content).label;
+    const dimensions = commentDimensions(row);
+    const date = row.published_at ? String(row.published_at).slice(0, 10) : null;
+    const tokens = tokenize(row.text_content);
+    const phrases = buildBigrams(tokens);
+    const emojis = extractEmojis(row.text_content);
+    const hashtags = extractHashtags(row.text_content);
+    for (const dimension of dimensions) {
+      const metric = metricBucket(metricBuckets, dimension.type, dimension.value);
+      metric.commentCount += 1;
+      metric[sentiment] += 1;
+      if (row.author_key) metric.authors.add(row.author_key);
+      if (date) {
+        const daily = metricBucket(
+          dailyBuckets,
+          dimension.type,
+          dimension.value,
+          date,
+        );
+        daily.commentCount += 1;
+        daily[sentiment] += 1;
+        if (row.author_key) daily.authors.add(row.author_key);
+      }
+      for (const label of ["all", sentiment]) {
+        for (const token of tokens) bumpTerm(termBuckets, dimension, label, "word", token);
+        for (const phrase of phrases) bumpTerm(termBuckets, dimension, label, "phrase", phrase);
+        for (const emoji of emojis) bumpTerm(termBuckets, dimension, label, "emoji", emoji);
+        for (const hashtag of hashtags) bumpTerm(termBuckets, dimension, label, "hashtag", hashtag);
+      }
+    }
+  }
+  const metrics = [...metricBuckets.values()]
+    .map(finalizeCommentMetric)
+    .sort((left, right) => right.commentCount - left.commentCount);
+  const dailyMetrics = [...dailyBuckets.values()]
+    .map(finalizeCommentMetric)
+    .sort(
+      (left, right) =>
+        String(left.commentDate).localeCompare(String(right.commentDate)) ||
+        right.commentCount - left.commentCount,
+    );
+  return {
+    metrics,
+    dailyMetrics,
+    terms: topTermRows(termBuckets),
+    summary: {
+      overall:
+        metrics.find(
+          (item) =>
+            item.dimensionType === "overall" && item.dimensionValue === "ALL",
+        ) ?? emptyCommentSummary().overall,
+      byTopic: metrics
+        .filter((item) => item.dimensionType === "query_topic")
+        .map((item) => ({ topic: item.dimensionValue, ...item })),
+    },
+  };
+}
+
 function opinionLines(opinion, locale) {
   const ja = locale === "ja-JP" || locale === "ja";
   const overall = opinion?.overall;
@@ -387,6 +576,7 @@ export function buildReportModel({
   popularMetrics,
   missingReactionCount,
   commentSummary = emptyCommentSummary(),
+  keywordSuggestions = [],
 }) {
   const topViews = [...postMetrics]
     .sort((left, right) => compareBigIntDesc(left, right, "latestViews"))
@@ -479,7 +669,14 @@ export function buildReportModel({
     "成長要因をより確実に判断するには、公開時刻、動画形式、観測期間を揃えてタイトルやテーマを検証する必要があります。",
     "短期的な成長が持続するかを確認するには、連続したスナップショットが必要です。",
   ];
-  const recommendationsZh = topGrowth[0]
+  const keywordRecommendationZh = keywordSuggestions.slice(0, 5).map((item) =>
+    `候选关键词「${item.candidate_text}」得分 ${Number(item.total_score).toFixed(1)}，建议进入人工批准队列；理由：${item.reason_text}`,
+  );
+  const keywordRecommendationJa = keywordSuggestions.slice(0, 5).map((item) =>
+    `候補キーワード「${item.candidate_text}」はスコア ${Number(item.total_score).toFixed(1)} です。承認候補として確認してください。理由：${item.reason_text}`,
+  );
+  const recommendationsZh = [
+    ...(topGrowth[0]
     ? [
         "围绕最高浏览主题制作 2 条新视频，并用相同 7 天窗口比较每日增长。",
         "复用最高增长视频的标题结构，只改变一个变量进行验证。",
@@ -491,8 +688,11 @@ export function buildReportModel({
           "将最高浏览主题作为观察候选，而不是立即下结论。",
           "持续观察热门榜出现次数与后续增长。",
         ]
-      : ["先运行真实数据采集，并在后续日期再次采集以建立连续快照。"];
-  const recommendationsJa = topGrowth[0]
+      : ["先运行真实数据采集，并在后续日期再次采集以建立连续快照。"]),
+    ...keywordRecommendationZh,
+  ];
+  const recommendationsJa = [
+    ...(topGrowth[0]
     ? [
         "最新閲覧数が最大のテーマを軸に新しい動画を 2 本制作し、同じ 7 日間で日次成長を比較します。",
         "最も成長した動画のタイトル構造を再利用し、変更する変数を 1 つに絞って検証します。",
@@ -504,7 +704,9 @@ export function buildReportModel({
           "最新閲覧数が最大のテーマは観察候補として扱い、すぐに結論づけません。",
           "急上昇ランキングの登場回数とその後の成長を継続して観察します。",
         ]
-      : ["実データを収集し、後日もう一度収集して連続スナップショットを作ります。"];
+      : ["実データを収集し、後日もう一度収集して連続スナップショットを作ります。"]),
+    ...keywordRecommendationJa,
+  ];
   const limitationsZh = [
     `${missingReactionCount} 条视频缺少点赞数或评论数，因此无法计算完整反应数和反应率。`,
     "YouTube 不公开分享数，反应数仅定义为点赞数加评论数。",
@@ -537,6 +739,7 @@ export function buildReportModel({
     topTopics,
     topQueries,
     topPopular,
+    keywordSuggestions,
     postById: new Map(postMetrics.map((item) => [item.postId, item])),
     summaryJson: {
       "zh-CN": {
@@ -596,6 +799,20 @@ function popularRows(model) {
           post?.title ?? item.postId,
         )} | ${item.appearanceCount} | ${item.latestRank} |`;
       })
+      .join("\n") || "| N/A | | | |"
+  );
+}
+
+function keywordSuggestionRows(items) {
+  return (
+    (items ?? [])
+      .slice(0, 8)
+      .map(
+        (item) =>
+          `| ${escapeMarkdown(item.candidate_text)} | ${escapeMarkdown(item.topic)} | ${Number(
+            item.total_score,
+          ).toFixed(1)} | ${escapeMarkdown(item.reason_text)} |`,
+      )
       .join("\n") || "| N/A | | | |"
   );
 }
@@ -662,6 +879,14 @@ ${bullets(summary.validationNeeds)}
 ## 企画・改善提案
 
 ${bullets(summary.recommendations)}
+
+## キーワード拡張候補
+
+未承認の候補だけを表示します。承認するまでは search.list クォータを消費しません。
+
+| 候補 | テーマ | スコア | 根拠 |
+| --- | --- | ---: | --- |
+${keywordSuggestionRows(model.keywordSuggestions)}
 
 ## コメント世論（試験的）
 
@@ -731,6 +956,14 @@ ${bullets(summary.validationNeeds)}
 ## 企划与改善建议
 
 ${bullets(summary.recommendations)}
+
+## 关键词扩展候选
+
+这里只展示未批准候选。候选在人工批准前不会消耗 search.list 配额。
+
+| 候选词 | 主题 | 分数 | 依据 |
+| --- | --- | ---: | --- |
+${keywordSuggestionRows(model.keywordSuggestions)}
 
 ## 评论舆论（实验性）
 
@@ -929,7 +1162,8 @@ async function runAnalysis(
       (item) => item.latestReactions === null,
     ).length;
     const [commentRows] = await pool.execute(
-      `SELECT c.comment_id, c.author_key, c.text_content,
+      `SELECT c.comment_id, c.post_id, p.title AS post_title, c.author_key,
+              c.text_content, c.published_at,
               GROUP_CONCAT(DISTINCT q.topic SEPARATOR '||') AS topics
        FROM comments c
        JOIN posts p ON p.post_id = c.post_id
@@ -937,11 +1171,20 @@ async function runAnalysis(
        LEFT JOIN tracked_queries q ON q.id = m.query_id
        WHERE c.is_available = TRUE
          AND c.last_seen_at BETWEEN ? AND ?
-       GROUP BY c.comment_id, c.author_key, c.text_content`,
+       GROUP BY c.comment_id, c.post_id, p.title, c.author_key,
+                c.text_content, c.published_at`,
       [toMysqlDateTime(windowStart), toMysqlDateTime(windowEnd)],
     );
-    const commentSummary = buildCommentMetrics(commentRows);
-    const commentTerms = buildCommentTerms(commentRows);
+    const commentInsights = buildCommentInsights(commentRows);
+    const commentSummary = commentInsights.summary;
+    const [keywordSuggestionRows] = await pool.query(
+      `SELECT candidate_text, topic, CAST(total_score AS CHAR) AS total_score,
+              reason_text
+       FROM keyword_candidates
+       WHERE status = 'suggested'
+       ORDER BY total_score DESC, last_seen_at DESC
+       LIMIT 8`,
+    );
     const reportModel = buildReportModel({
       analysisRunId,
       windowStart,
@@ -952,6 +1195,7 @@ async function runAnalysis(
       popularMetrics,
       missingReactionCount,
       commentSummary,
+      keywordSuggestions: keywordSuggestionRows,
     });
     const report = renderReport(reportModel, "zh-CN");
     const reportJa = renderReport(reportModel, "ja-JP");
@@ -1050,19 +1294,7 @@ async function runAnalysis(
           ],
         );
       }
-      const commentMetricRows = [
-        {
-          dimensionType: "overall",
-          dimensionValue: "ALL",
-          ...reportModel.opinion.overall,
-        },
-        ...reportModel.opinion.byTopic.map((topic) => ({
-          dimensionType: "query_topic",
-          dimensionValue: topic.topic,
-          ...topic,
-        })),
-      ];
-      for (const item of commentMetricRows) {
+      for (const item of commentInsights.metrics) {
         await connection.execute(
           `INSERT INTO analysis_comment_metrics
             (analysis_run_id, dimension_type, dimension_value, comment_count,
@@ -1082,17 +1314,44 @@ async function runAnalysis(
           ],
         );
       }
-      const commentTermRows = [
-        ...commentTerms.words.map((item) => ({ type: "word", ...item })),
-        ...commentTerms.emojis.map((item) => ({ type: "emoji", ...item })),
-        ...commentTerms.hashtags.map((item) => ({ type: "hashtag", ...item })),
-      ];
-      for (const item of commentTermRows) {
+      for (const item of commentInsights.dailyMetrics) {
+        await connection.execute(
+          `INSERT INTO analysis_comment_daily_metrics
+            (analysis_run_id, comment_date, dimension_type, dimension_value,
+             comment_count, distinct_authors, positive_count, neutral_count,
+             negative_count, net_sentiment_pct)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            analysisRunId,
+            item.commentDate,
+            item.dimensionType,
+            item.dimensionValue,
+            item.commentCount,
+            item.distinctAuthors,
+            item.positive,
+            item.neutral,
+            item.negative,
+            item.netSentimentPct,
+          ],
+        );
+      }
+      for (const item of commentInsights.terms) {
         await connection.execute(
           `INSERT INTO analysis_comment_terms
-            (analysis_run_id, term_type, term, count)
-           VALUES (?, ?, ?, ?)`,
-          [analysisRunId, item.type, item.term, item.count],
+            (analysis_run_id, dimension_type, dimension_value, sentiment_label,
+             term_type, term, count, share_pct, lift_score)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            analysisRunId,
+            item.dimensionType,
+            item.dimensionValue,
+            item.sentimentLabel,
+            item.termType,
+            item.term,
+            item.count,
+            item.sharePct,
+            item.liftScore,
+          ],
         );
       }
     });

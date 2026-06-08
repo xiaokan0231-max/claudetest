@@ -2,6 +2,7 @@ import {
   createAppPool,
   createCollectionBatch,
   finishCollectionBatch,
+  recordCollectionQuotaUsage,
   recordCollectionRun,
   withAdvisoryLock,
   withTransaction,
@@ -15,7 +16,11 @@ import {
   toMysqlDateTime,
   unique,
 } from "./utils.js";
-import { estimateCollectionQuota, YouTubeClient } from "./youtube.js";
+import {
+  estimateCollectionQuotaBuckets,
+  QUOTA_BUCKETS,
+  YouTubeClient,
+} from "./youtube.js";
 
 function errorSummary(error) {
   return String(error?.message ?? error).slice(0, 4000);
@@ -362,6 +367,26 @@ function commentRequestBudget(config) {
     : 0;
 }
 
+export function collectionConfigForMode(config, mode = "standard") {
+  if (mode === "standard") {
+    return config;
+  }
+  if (mode !== "balanced") {
+    throw new Error("--mode must be standard or balanced");
+  }
+  if (!config.commentFetch.enabled) {
+    return config;
+  }
+  return {
+    ...config,
+    commentFetch: {
+      ...config.commentFetch,
+      maxVideos: Math.max(Number(config.commentFetch.maxVideos), 30),
+      maxPages: Math.max(Number(config.commentFetch.maxPages), 2),
+    },
+  };
+}
+
 async function upsertComments(connection, rows, batchId, observedAt) {
   let count = 0;
   for (const row of rows) {
@@ -469,7 +494,10 @@ async function collectComments(pool, client, config, batchId, observedAt, postId
         quotaUnits: client.quotaUsed - quotaBefore,
         errorSummary: disabled ? "commentsDisabled" : errorSummary(error),
       });
-      if (message.includes("SNS_QUOTA_BUDGET")) {
+      if (
+        message.includes("SNS_QUOTA_BUDGET") ||
+        message.includes("SNS_SEARCH_QUOTA_BUDGET")
+      ) {
         throw error;
       }
     }
@@ -477,20 +505,34 @@ async function collectComments(pool, client, config, batchId, observedAt, postId
   return totalStored;
 }
 
-export async function estimateCollection(config) {
+export async function estimateCollection(config, { mode = "standard" } = {}) {
+  const effectiveConfig = collectionConfigForMode(config, mode);
   const pool = createAppPool(config);
   try {
     const queries = await loadActiveQueries(pool);
-    const activePostIds = await loadActivePostIds(pool, config.activeWindowDays);
+    const activePostIds = await loadActivePostIds(
+      pool,
+      effectiveConfig.activeWindowDays,
+    );
+    const estimatedQuotaByBucket = estimateCollectionQuotaBuckets(
+      queries,
+      activePostIds.length,
+      commentRequestBudget(effectiveConfig),
+    );
     return {
+      mode,
       queryCount: queries.length,
       activePostCount: activePostIds.length,
-      estimatedQuotaUnits: estimateCollectionQuota(
-        queries,
-        activePostIds.length,
-        commentRequestBudget(config),
-      ),
-      quotaBudget: config.quotaBudget,
+      estimatedQuotaUnits: estimatedQuotaByBucket[QUOTA_BUCKETS.standard],
+      quotaBudget: effectiveConfig.quotaBudget,
+      searchQuotaBudget: effectiveConfig.searchQuotaBudget,
+      estimatedQuotaByBucket,
+      plannedCommentVideos: effectiveConfig.commentFetch.enabled
+        ? effectiveConfig.commentFetch.maxVideos
+        : 0,
+      plannedCommentPages: effectiveConfig.commentFetch.enabled
+        ? effectiveConfig.commentFetch.maxPages
+        : 0,
     };
   } finally {
     await pool.end();
@@ -500,27 +542,40 @@ export async function estimateCollection(config) {
 async function runCollection(
   config,
   pool,
-  { triggerType = "manual", requestId = null, fetchImpl } = {},
+  { triggerType = "manual", requestId = null, fetchImpl, mode = "standard" } = {},
 ) {
+  const effectiveConfig = collectionConfigForMode(config, mode);
   let batchId;
   const observedAt = new Date();
   const client = new YouTubeClient({
-    apiKey: config.youtubeApiKey,
-    quotaBudget: config.quotaBudget,
+    apiKey: effectiveConfig.youtubeApiKey,
+    quotaBudget: effectiveConfig.quotaBudget,
+    searchQuotaBudget: effectiveConfig.searchQuotaBudget,
     fetchImpl,
   });
 
   try {
     const queries = await loadActiveQueries(pool);
-    const activePostIds = await loadActivePostIds(pool, config.activeWindowDays);
-    const estimatedQuotaUnits = estimateCollectionQuota(
+    const activePostIds = await loadActivePostIds(
+      pool,
+      effectiveConfig.activeWindowDays,
+    );
+    const estimatedQuotaByBucket = estimateCollectionQuotaBuckets(
       queries,
       activePostIds.length,
-      commentRequestBudget(config),
+      commentRequestBudget(effectiveConfig),
     );
-    if (estimatedQuotaUnits > config.quotaBudget) {
+    const estimatedQuotaUnits = estimatedQuotaByBucket[QUOTA_BUCKETS.standard];
+    if (estimatedQuotaUnits > effectiveConfig.quotaBudget) {
       throw new Error(
-        `Estimated collection cost ${estimatedQuotaUnits} exceeds SNS_QUOTA_BUDGET=${config.quotaBudget}`,
+        `Estimated collection cost ${estimatedQuotaUnits} exceeds SNS_QUOTA_BUDGET=${effectiveConfig.quotaBudget}`,
+      );
+    }
+    if (
+      estimatedQuotaByBucket[QUOTA_BUCKETS.search] > effectiveConfig.searchQuotaBudget
+    ) {
+      throw new Error(
+        `Estimated search cost ${estimatedQuotaByBucket[QUOTA_BUCKETS.search]} exceeds SNS_SEARCH_QUOTA_BUDGET=${effectiveConfig.searchQuotaBudget}`,
       );
     }
 
@@ -634,8 +689,8 @@ async function runCollection(
     });
 
     let commentCount = 0;
-    if (config.commentFetch.enabled) {
-      if (!config.commentFetch.salt) {
+    if (effectiveConfig.commentFetch.enabled) {
+      if (!effectiveConfig.commentFetch.salt) {
         throw new Error(
           "COMMENT_HMAC_SALT is required when SNS_COLLECT_COMMENTS=true",
         );
@@ -649,19 +704,25 @@ async function runCollection(
          ) t
          JOIN v_latest_post_metrics v ON v.post_id = t.post_id
          ORDER BY v.views DESC
-         LIMIT ${Number(config.commentFetch.maxVideos)}`,
+         LIMIT ${Number(effectiveConfig.commentFetch.maxVideos)}`,
         [batchId, batchId],
       );
       commentCount = await collectComments(
         pool,
         client,
-        config,
+        effectiveConfig,
         batchId,
         observedAt,
         targetRows.map((row) => row.post_id),
       );
     }
 
+    await recordCollectionQuotaUsage(
+      pool,
+      batchId,
+      estimatedQuotaByBucket,
+      client.quotaUsedByBucket,
+    );
     await finishCollectionBatch(pool, batchId, {
       status: "success",
       actualQuotaUnits: client.quotaUsed,
@@ -670,6 +731,7 @@ async function runCollection(
     return {
       batchId,
       observedAt,
+      mode,
       queryCount: queries.length,
       discoveredVideoCount: discoveredIds.length,
       refreshedVideoCount: videoItems.length,
@@ -679,9 +741,17 @@ async function runCollection(
       unavailableCount,
       estimatedQuotaUnits,
       actualQuotaUnits: client.quotaUsed,
+      estimatedQuotaByBucket,
+      actualQuotaByBucket: client.quotaUsedByBucket,
     };
   } catch (error) {
     if (batchId) {
+      await recordCollectionQuotaUsage(
+        pool,
+        batchId,
+        {},
+        client.quotaUsedByBucket,
+      );
       await finishCollectionBatch(pool, batchId, {
         status: "failed",
         actualQuotaUnits: client.quotaUsed,
@@ -694,12 +764,12 @@ async function runCollection(
 
 export async function collect(
   config,
-  { triggerType = "manual", requestId = null, fetchImpl } = {},
+  { triggerType = "manual", requestId = null, fetchImpl, mode = "standard" } = {},
 ) {
   const pool = createAppPool(config);
   try {
     return await withAdvisoryLock(pool, "sns_trend_lab_collect", () =>
-      runCollection(config, pool, { triggerType, requestId, fetchImpl }),
+      runCollection(config, pool, { triggerType, requestId, fetchImpl, mode }),
     );
   } finally {
     await pool.end();

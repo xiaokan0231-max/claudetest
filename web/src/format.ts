@@ -2,10 +2,18 @@ export type Locale = "zh-CN" | "ja-JP";
 
 export function formatCount(value: unknown, locale: Locale): string {
   if (value === null || value === undefined || value === "") return "N/A";
+  if (typeof value === "number") {
+    return Number.isInteger(value)
+      ? value.toLocaleString(locale)
+      : value.toLocaleString(locale, { maximumFractionDigits: 2 });
+  }
   try {
     return BigInt(String(value)).toLocaleString(locale);
   } catch {
-    return String(value);
+    const number = Number(value);
+    return Number.isFinite(number)
+      ? number.toLocaleString(locale, { maximumFractionDigits: Number.isInteger(number) ? 0 : 2 })
+      : String(value);
   }
 }
 

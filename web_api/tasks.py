@@ -118,6 +118,9 @@ async def execute_operation(
 
     if operation_type == "collect":
         args = ["collect", "--trigger", "web", "--request-id", request_id]
+        mode = parameters.get("mode")
+        if mode in {"standard", "balanced"}:
+            args.extend(["--mode", mode])
     elif operation_type == "analyze":
         args = [
             "analyze",
