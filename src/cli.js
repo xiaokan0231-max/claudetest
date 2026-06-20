@@ -310,7 +310,7 @@ async function main() {
       break;
     }
     case "collect": {
-      const config = getConfig({ requireApiKey: true });
+      const config = getConfig({ requireApiKey: true, requireCommentSalt: true });
       const triggerType = options.trigger || "manual";
       if (!["manual", "scheduled", "web"].includes(triggerType)) {
         throw new Error("--trigger must be manual, scheduled, or web");

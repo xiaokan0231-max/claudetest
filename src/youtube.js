@@ -3,7 +3,11 @@ import { chunk, sleep } from "./utils.js";
 const API_BASE = "https://www.googleapis.com/youtube/v3";
 
 export const QUOTA_COSTS = {
+  // One search.list REQUEST (the per-day request guard lives in the search bucket).
   searchList: 1,
+  // The REAL standard-unit cost YouTube bills for a single search.list call (100),
+  // charged to the standard bucket so the 10k-units/day pool is accounted honestly.
+  searchListUnits: 100,
   videosList: 1,
   channelsList: 1,
   categoriesList: 1,
@@ -38,6 +42,7 @@ export function estimateCollectionQuotaBuckets(
   return {
     [QUOTA_BUCKETS.search]: queries.length * QUOTA_COSTS.searchList,
     [QUOTA_BUCKETS.standard]:
+    queries.length * QUOTA_COSTS.searchListUnits +
     QUOTA_COSTS.videosList +
     QUOTA_COSTS.categoriesList +
     detailRequests * QUOTA_COSTS.videosList +
@@ -97,17 +102,40 @@ export class YouTubeClient {
     }
   }
 
-  async request(resource, params, cost, bucket = QUOTA_BUCKETS.standard) {
+  async request(
+    resource,
+    params,
+    cost,
+    bucket = QUOTA_BUCKETS.standard,
+    standardUnits = 0,
+  ) {
+    // standardUnits lets a non-standard-bucket call (search.list) also charge the
+    // standard pool its true unit cost, so both buckets are guarded honestly.
+    const alsoStandard =
+      standardUnits > 0 && bucket !== QUOTA_BUCKETS.standard;
+
+    // Guard and charge quota exactly ONCE per call, before the retry loop. YouTube
+    // bills a (succeeded-or-failed) call once regardless of transient-error retries,
+    // so charging inside the loop would over-count by 1x..3x — badly so for search's
+    // 100 standard units — and could spuriously trip the budget on a retry.
+    this.ensureBudget(cost, bucket);
+    if (alsoStandard) {
+      this.ensureBudget(standardUnits, QUOTA_BUCKETS.standard);
+    }
+    this.quotaUsedByBucket[bucket] =
+      (this.quotaUsedByBucket[bucket] ?? 0) + cost;
+    if (alsoStandard) {
+      this.quotaUsedByBucket[QUOTA_BUCKETS.standard] =
+        (this.quotaUsedByBucket[QUOTA_BUCKETS.standard] ?? 0) + standardUnits;
+    }
+    this.quotaUsed = this.quotaUsedByBucket[QUOTA_BUCKETS.standard];
+
+    const url = buildYouTubeApiUrl(resource, {
+      ...params,
+      key: this.apiKey,
+    });
     let lastError;
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      this.ensureBudget(cost, bucket);
-      const url = buildYouTubeApiUrl(resource, {
-        ...params,
-        key: this.apiKey,
-      });
-      this.quotaUsedByBucket[bucket] =
-        (this.quotaUsedByBucket[bucket] ?? 0) + cost;
-      this.quotaUsed = this.quotaUsedByBucket[QUOTA_BUCKETS.standard];
       this.requestCount += 1;
 
       try {
@@ -157,6 +185,7 @@ export class YouTubeClient {
       },
       QUOTA_COSTS.searchList,
       QUOTA_BUCKETS.search,
+      QUOTA_COSTS.searchListUnits,
     );
   }
 

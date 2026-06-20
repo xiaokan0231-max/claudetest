@@ -28,7 +28,7 @@ class Settings:
     mysql_database: str = os.getenv("MYSQL_DATABASE", "sns_trend_lab")
     mysql_user: str = os.getenv("MYSQL_USER", "sns_collector")
     mysql_password: str = os.getenv("MYSQL_PASSWORD", "")
-    quota_budget: int = _integer("SNS_QUOTA_BUDGET", 1000)
+    quota_budget: int = _integer("SNS_QUOTA_BUDGET", 10000)
     search_quota_budget: int = _integer("SNS_SEARCH_QUOTA_BUDGET", 100)
     timezone: str = os.getenv("SNS_TIMEZONE", "Asia/Tokyo")
     youtube_api_configured: bool = bool(os.getenv("YOUTUBE_API_KEY"))
