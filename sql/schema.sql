@@ -627,12 +627,28 @@ SELECT
   s.likes,
   s.comments
 FROM popular_video_observations o
+-- Resolve the latest batch per region/category once with a single grouped scan,
+-- then join it back. The previous correlated `o.batch_id = (SELECT MAX(...) WHERE
+-- region/category match)` ran that aggregate once per row (O(n^2): ~4.4k x ~4.4k
+-- table scans => ~2.2s) and the `<=>` comparison blocked index use.
+JOIN (
+  SELECT region_code, category_id, MAX(batch_id) AS batch_id
+  FROM popular_video_observations
+  GROUP BY region_code, category_id
+) latest
+  ON latest.region_code = o.region_code
+  AND latest.category_id <=> o.category_id
+  AND latest.batch_id = o.batch_id
 JOIN posts p ON p.post_id = o.post_id
 JOIN channels c ON c.channel_id = p.channel_id
-LEFT JOIN v_latest_post_metrics s ON s.post_id = p.post_id
-WHERE o.batch_id = (
-  SELECT MAX(latest_o.batch_id)
-  FROM popular_video_observations latest_o
-  WHERE latest_o.region_code = o.region_code
-    AND latest_o.category_id <=> o.category_id
-);
+-- Fetch the latest snapshot for each of the (few) popular posts via an indexed
+-- per-post lookup (idx_post_metric_snapshots_post_observed) instead of joining
+-- v_latest_post_metrics, which would materialize the latest-snapshot window over
+-- the entire post_metric_snapshots table (~250k rows) just to enrich ~50 rows.
+LEFT JOIN LATERAL (
+  SELECT s_inner.views, s_inner.likes, s_inner.comments
+  FROM post_metric_snapshots s_inner
+  WHERE s_inner.post_id = o.post_id
+  ORDER BY s_inner.observed_at DESC, s_inner.id DESC
+  LIMIT 1
+) s ON TRUE;
