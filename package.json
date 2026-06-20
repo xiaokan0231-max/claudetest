@@ -28,7 +28,8 @@
     "react-dom": "^19.2.7",
     "react-i18next": "^17.0.8",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "undici": "^7.27.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",

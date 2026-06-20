@@ -10,6 +10,7 @@ import {
   listKeywordCandidates,
   updateKeywordCandidateStatus,
 } from "./keyword-suggestions.js";
+import { configureProxyFromEnv } from "./proxy.js";
 import { buildQuotaPlan } from "./quota-optimizer.js";
 import {
   installSchedule,
@@ -234,6 +235,9 @@ async function main() {
     printHelp();
     return;
   }
+
+  // Route fetch through the configured proxy before any YouTube API call.
+  await configureProxyFromEnv();
 
   switch (command) {
     case "db:init": {
