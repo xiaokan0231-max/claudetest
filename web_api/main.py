@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -18,10 +19,24 @@ from .config import settings
 from .db import engine, fetch_all, fetch_one, serialize_row
 from .quota import fetch_google_quota
 from .security import ACTION_TOKEN, require_write_request
-from .tasks import launch_operation, run_node_cli
+from .tasks import launch_operation, reconcile_stale_operations, run_node_cli
 
 
-app = FastAPI(title="SNS Trend Lab", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # Self-heal operations orphaned by a previous crash/restart so the single-active
+    # guard can never permanently wedge the write path. Best-effort: a startup DB
+    # hiccup must not prevent the server (which is mostly read-only) from booting.
+    try:
+        reconcile_stale_operations()
+    except Exception:  # noqa: BLE001 - never block startup on reconciliation
+        pass
+    yield
+
+
+app = FastAPI(
+    title="SNS Trend Lab", docs_url=None, redoc_url=None, lifespan=lifespan
+)
 
 
 def error_response(status_code: int, code: str, message: str) -> JSONResponse:

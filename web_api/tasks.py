@@ -71,6 +71,28 @@ def run_node_cli(args: list[str]) -> dict[str, Any]:
     return payload
 
 
+def reconcile_stale_operations() -> int:
+    """Fail operation_requests left 'queued'/'running' by a previous process.
+
+    A web operation is an in-process asyncio task (see launch_operation). If the
+    server restarts or crashes while one is active, its row can never complete on
+    its own, and create_operation's single-active guard then rejects every future
+    collect/analyze with OPERATION_CONFLICT until the row is edited by hand. Run
+    this once at startup so a crash is self-healing. Returns rows reconciled.
+    """
+    with engine.begin() as connection:
+        result = connection.execute(
+            text(
+                "UPDATE operation_requests "
+                "SET status = 'failed', completed_at = :now, "
+                "    error_summary = 'reconciled: server restarted while operation was active' "
+                "WHERE status IN ('queued', 'running')"
+            ),
+            {"now": utc_now()},
+        )
+        return result.rowcount or 0
+
+
 def create_operation(operation_type: str, parameters: dict[str, Any]) -> str:
     request_id = str(uuid.uuid4())
     with engine.begin() as connection:

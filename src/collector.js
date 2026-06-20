@@ -2,6 +2,7 @@ import {
   createAppPool,
   createCollectionBatch,
   finishCollectionBatch,
+  reapStaleRunningBatches,
   recordCollectionQuotaUsage,
   recordCollectionRun,
   withAdvisoryLock,
@@ -578,6 +579,10 @@ async function runCollection(
         `Estimated search cost ${estimatedQuotaByBucket[QUOTA_BUCKETS.search]} exceeds SNS_SEARCH_QUOTA_BUDGET=${effectiveConfig.searchQuotaBudget}`,
       );
     }
+
+    // Held inside the collect advisory lock, so any 'running' batch is a zombie
+    // from a crashed run; reap it before starting a fresh one.
+    await reapStaleRunningBatches(pool);
 
     batchId = await createCollectionBatch(pool, {
       observedAt,

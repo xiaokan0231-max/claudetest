@@ -398,6 +398,22 @@ export async function createCollectionBatch(
   return result.insertId;
 }
 
+// Reap orphaned 'running' batches left by a crashed/killed collection. Safe to
+// call only while holding the collect advisory lock: the lock guarantees no other
+// collection is in flight, so any still-'running' batch is a zombie. Returns the
+// number of batches reaped. Without this, a SIGKILL mid-run leaves a permanent
+// 'running' row that misleads dashboards and freshness/quota views.
+export async function reapStaleRunningBatches(pool) {
+  const [result] = await pool.execute(
+    `UPDATE collection_batches
+     SET completed_at = ?, status = 'failed',
+         error_summary = 'reaped: orphaned running batch (process restart)'
+     WHERE status = 'running'`,
+    [toMysqlDateTime(new Date())],
+  );
+  return result.affectedRows ?? 0;
+}
+
 export async function finishCollectionBatch(
   pool,
   batchId,
