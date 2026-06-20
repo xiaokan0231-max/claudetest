@@ -39,9 +39,14 @@ def test_dashboard_and_default_video_scope_use_real_database():
     assert dashboard.status_code == 200
     assert videos.status_code == 200
     assert dashboard.json()["analysisRunId"]
-    assert int(videos.json()["total"]) == int(
-        dashboard.json()["stats"]["keyword_sample_videos"]
-    )
+    # The default video scope is the keyword sample of the latest analysis run, which
+    # is a subset of all-time keyword-sample videos: equal right after an analyze, but
+    # smaller whenever collection has since added samples not yet analyzed. Assert the
+    # true invariant (subset, both populated) rather than exact equality, which flaps
+    # on every collection that runs between analyses.
+    videos_total = int(videos.json()["total"])
+    keyword_sample_videos = int(dashboard.json()["stats"]["keyword_sample_videos"])
+    assert 0 < videos_total <= keyword_sample_videos
     assert videos.json()["items"]
     assert isinstance(videos.json()["items"][0]["latest_views"], str)
 

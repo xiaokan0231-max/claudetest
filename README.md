@@ -174,6 +174,20 @@ views `v_latest_post_metrics`, `v_post_growth_metrics`, `v_latest_query_metrics`
 - Treat YouTube `estimated_total_results` as a directional signal, not exact search
   volume. Sentiment is a heuristic estimate; correlation is not causation.
 
+### Before you publish this repo
+
+This repo is meant to be shareable, but a few local artifacts must never leave your
+machine. Check before pushing to a public remote:
+
+- `.env` is git-ignored — confirm it (and any MySQL dump) is not staged. It holds
+  your API key, DB password, and `COMMENT_HMAC_SALT`.
+- Comment collection stores PII-scrubbed, author-pseudonymized text. Do not commit
+  or share a database dump; the salt that de-anonymizes nothing on its own still
+  pairs with the stored rows.
+- Any personal notes kept in the working tree (e.g. interview prep) are git-ignored
+  by name — keep them that way.
+- Licensed under [MIT](LICENSE).
+
 ## Testing
 
 ```bash
