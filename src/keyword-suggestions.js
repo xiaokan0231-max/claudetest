@@ -238,12 +238,25 @@ function scoreTermCandidate(text, row) {
   };
 }
 
-function totalScore(scores) {
+// Weights MUST sum to 1. `growth` was previously computed, stored, and shown in
+// the UI's five-score breakdown but carried zero weight here, so "rising-but-quiet"
+// candidates — the exact opportunities the discovery loop is meant to surface —
+// were systematically under-ranked. It now carries real weight.
+export const SCORE_WEIGHTS = {
+  heat: 0.3,
+  comment: 0.25,
+  growth: 0.2,
+  relevance: 0.2,
+  freshness: 0.05,
+};
+
+export function totalScore(scores) {
   return (
-    scores.heat * 0.35 +
-    scores.comment * 0.3 +
-    scores.relevance * 0.25 +
-    scores.freshness * 0.1
+    scores.heat * SCORE_WEIGHTS.heat +
+    scores.comment * SCORE_WEIGHTS.comment +
+    scores.growth * SCORE_WEIGHTS.growth +
+    scores.relevance * SCORE_WEIGHTS.relevance +
+    scores.freshness * SCORE_WEIGHTS.freshness
   );
 }
 

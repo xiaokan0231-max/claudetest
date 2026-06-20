@@ -49,6 +49,16 @@ test("buildPostMetrics calculates exact growth for very large counters", () => {
   assert.equal(metrics[0].latestReactions, "14");
 });
 
+test("buildPostMetrics does not flag low base when views are unknown", () => {
+  // A missing view count must not coerce to 0 and read as "< 100" (low base).
+  const [missing] = buildPostMetrics([snapshot({ views: null })]);
+  assert.equal(missing.lowBaseReactionRate, false);
+  const [real] = buildPostMetrics([snapshot({ views: "42" })]);
+  assert.equal(real.lowBaseReactionRate, true);
+  const [high] = buildPostMetrics([snapshot({ views: "5000" })]);
+  assert.equal(high.lowBaseReactionRate, false);
+});
+
 test("buildPostMetrics keeps reactions null when a component is unavailable", () => {
   const [metric] = buildPostMetrics([snapshot({ likes: null })]);
   assert.equal(metric.latestReactions, null);
@@ -143,6 +153,19 @@ test("scoreSentiment labels JA/ZH/emoji comment text", () => {
   assert.equal(scoreSentiment("最悪、つまらない").label, "negative");
   assert.equal(scoreSentiment("普通の内容です").label, "neutral");
   assert.equal(scoreSentiment("").label, "neutral");
+});
+
+test("scoreSentiment flips negated positives instead of scoring them positive", () => {
+  // Negated forms keep the positive substring; they must not score positive.
+  assert.equal(scoreSentiment("不好看").label, "negative");
+  assert.equal(scoreSentiment("不喜欢这个视频").label, "negative");
+  assert.equal(scoreSentiment("好きじゃない").label, "negative");
+  assert.equal(scoreSentiment("not good at all").label, "negative");
+  // Genuine positives are unaffected, including emphatic-particle slang.
+  assert.equal(scoreSentiment("とても面白い").label, "positive");
+  assert.equal(scoreSentiment("好き").label, "positive");
+  assert.equal(scoreSentiment("すごいねえ").label, "positive");
+  assert.equal(scoreSentiment("最高ねえ").label, "positive");
 });
 
 test("buildCommentMetrics aggregates overall and per-topic sentiment", () => {

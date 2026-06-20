@@ -73,6 +73,7 @@ export function buildPostMetrics(snapshotRows) {
       rows.length > 1 ? signedDifference(latest.views, earliest.views) : null;
     const elapsedMs =
       mysqlDateToDate(latest.observed_at) - mysqlDateToDate(earliest.observed_at);
+    const latestViews = bigIntOrNull(latest.views);
     const latestLikes = bigIntOrNull(latest.likes);
     const latestComments = bigIntOrNull(latest.comments);
     const reactions =
@@ -114,7 +115,8 @@ export function buildPostMetrics(snapshotRows) {
         reactions !== null
           ? decimalRatio(reactions, latest.views, { multiplier: 100n })
           : null,
-      lowBaseReactionRate: bigIntOrNull(latest.views) < 100n,
+      // A missing view count is unknown, not "low base"; only flag a real < 100.
+      lowBaseReactionRate: latestViews !== null && latestViews < 100n,
     });
   }
   return metrics;
